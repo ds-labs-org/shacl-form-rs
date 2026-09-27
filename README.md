@@ -56,7 +56,7 @@ see `shacl-form-core/tests/honeycomb.rs`), not just hand-written fixtures.
 |---|---|
 | `sh:path <iri>` | the field's predicate |
 | `sh:path` (blank-node: sequence/alternative/inverse/`*`/`+`/`?`) | field still listed, reported unsupported, not editable |
-| `sh:datatype` | the matching `Text`/`Number`/`Boolean`/`Date`/`DateTime`/`Iri` control |
+| `sh:datatype` | the matching `Text`/`Number`/`Boolean`/`Date`/`DateTime`/`Iri` control — `xsd:anyURI` is `Text` (with that datatype preserved), not `Iri`: `sh:datatype` only ever constrains a *literal*, and `Iri` is a resource reference with no datatype at all |
 | `sh:nodeKind sh:IRI` | `Iri`; `BlankNode`/mixed kinds reported unsupported, rendered as text |
 | `sh:in` | `Select`, options exactly as listed |
 | `sh:hasValue` | `Select` with that one option |
@@ -76,6 +76,7 @@ see `shacl-form-core/tests/honeycomb.rs`), not just hand-written fixtures.
 | `sh:node` and `sh:class` both stated on one property | nests via `sh:node`'s own shape (an exact reference beats "however many shapes target this class"), but still asserts `sh:class`'s class as `rdf:type` — noted, not silently dropped |
 | re-saving an untouched value nested under `sh:node`/`sh:class` (edit mode) | reuses the subject it was read from (`ValueEntry::Nested`'s own `subject`); does not replace it with a fresh blank node, and mints the same stable id on repeated `to_turtle` calls for a value that has none yet (a resubmit after a failed save doesn't invent a second resource for the same unsaved value) |
 | `sh:or ()` / `sh:xone ()` (an empty branch list) | reported as unsupported, not silently ignored |
+| an instance subject reachable through its own `sh:node`/`sh:class` nesting again — a self-loop, or a longer cycle (`ex:alice ex:knows ex:alice`, or `A -> B -> A`) | not re-expanded (a real cycle, detected by ancestry on the current read path — its own identity is still kept, just no further fields), and a subject reached again at the same nesting depth via a *different*, non-ancestor path reuses the one already-read `Rc<FormValues>` instead of re-walking it — see `FormValues::read_from_instance`'s own doc comment |
 
 Nothing here is silently approximated: a construct this crate can't
 faithfully turn into a control is named in `Field::unsupported` /
@@ -122,6 +123,69 @@ in time proportional to the tree's *distinct* schemas, not to how many
   `shacl-form-error`, `shacl-form-unsupported`, `shacl-form-required`,
   `shacl-form-add`/`shacl-form-remove`) the same way `ds-honeycomb-editor-rs`
   leaves colour and theme to its host.
+- `read_from_instance` shares one `Rc<FormValues>` across every occurrence
+  of the same subject at the same nesting depth (see the coverage table),
+  but the tree it builds is still a tree, not a graph: editing one
+  occurrence clones only *that* occurrence's own spine (`paths::update_at`),
+  so a sibling occurrence reached through a different, non-ancestor path to
+  the identical subject keeps showing the pre-edit value until the form is
+  reloaded. A densely cross-referenced instance (many subjects that mutually
+  reference each other, read near `MAX_NESTING_DEPTH`) is no longer
+  unbounded or slow to read — real cycles are caught and shared reads are
+  reused, not re-walked — but can still render a genuinely large number of
+  fields, one per distinct non-cyclic path through the data, not per
+  distinct subject: closing both fully would need the renderer to
+  understand "this is the same resource shown twice", which is a bigger,
+  separate redesign.
+- Several constraints are silently unenforced (not even noted) when they
+  land next to a different, unrelated one that wins the field's `kind`:
+  `sh:in`/`sh:hasValue` stated alongside `sh:class`/`sh:node` (the nesting
+  wins; the enumeration is dropped); `sh:pattern`/`sh:minLength`/
+  `sh:maxLength` on a property whose kind isn't `Text` (e.g. paired with
+  `sh:nodeKind sh:IRI` or a numeric `sh:datatype`); a numeric
+  `sh:minInclusive`/`sh:maxInclusive`/etc. paired with `xsd:date`/
+  `xsd:dateTime` (silently dropped rather than applied as the control's own
+  `min`/`max`, which HTML's date/datetime-local inputs do support).
+- `sh:pattern` and `sh:hasValue` are read once per property-shape *node*
+  (`object_for_subject_predicate`, not `objects_for_subject_predicate`): a
+  single property shape stating the same predicate more than once (legal
+  RDF, unusual SHACL) has all but one value silently ignored, with no note
+  — unlike two different `sh:and` branches each stating one, which do
+  accumulate.
+- A blank-node-valued property this crate cannot nest (`sh:class` with no
+  matching shape, `sh:nodeKind sh:BlankNodeOrIRI`, or a `sh:node`/`sh:class`
+  reference past `MAX_NESTING_DEPTH`) is invisible to `read_from_instance`:
+  the value is neither shown nor kept, so re-saving an otherwise-untouched
+  instance silently drops it rather than round-tripping it unedited.
+- A literal's language tag (`"Bonjour"@fr`) is lost the moment that value is
+  edited (`literal_entry` always builds a typed literal, never a
+  language-tagged one), and `sh:datatype rdf:langString` — common in
+  SKOS/DCAT shapes — is reported as an unrecognised datatype and, if typed
+  into, serialises as `"…"^^rdf:langString`, which is not well-formed RDF
+  (a `rdf:langString` requires a tag).
+- `xsd:dateTimeStamp` (a timezone is mandatory) uses the same
+  `datetime-local` control as `xsd:dateTime` (no timezone at all), so an
+  edited value is never a legal lexical form for it; reading back an
+  existing `xsd:dateTime`/`xsd:date` value that *does* carry a timezone or
+  offset and re-typing even one character of it drops that offset, since
+  `datetime-local`/`date` have nowhere to hold one.
+- An integer field's `sh:minInclusive`/`sh:maxExclusive` etc. is used as
+  HTML's `min`/`max` as stated, even when it is not itself a whole number
+  (`sh:minExclusive 0.5` on an integer becomes `min=1.5`); combined with
+  `step=1`, HTML then rejects every legal integer value. The number control
+  also round-trips exponent notation (`1e5`, which `<input type=number>`
+  accepts and returns as-is) as that literal string, which is not a valid
+  `xsd:integer`/`xsd:decimal` lexical form.
+- `Select`'s options are matched by their lexical string alone
+  (`controls.rs`'s `term_as_string`), not datatype or language: two
+  `sh:in` values that stringify the same (`"1"` and `1`, or `"chat"@fr` and
+  `"chat"@en`) collide onto one selectable option, and a current or default
+  value that isn't among the options at all displays as unselected ("—")
+  while still being submitted unchanged if the field is never touched.
+- A `sh:deactivated` node shape is itself skipped, but its own `sh:node`/
+  `sh:and` references are still expanded into the merged shape set before
+  that filter runs — a deactivated shape's *inherited* properties still
+  show up even though the shape stating them does not.
 
 ## Design notes (why it's built this way)
 
@@ -150,6 +214,31 @@ in time proportional to the tree's *distinct* schemas, not to how many
   cache, the same shape reached the same way at the same depth is computed
   once and shared; see `shacl-form-core/tests/robustness.rs`'s own
   `a_self_referencing_shape_with_several_such_properties_does_not_expand_exponentially`.
+- **`read_from_instance` makes the same trade on the *data* side that
+  `ShapeCache` makes on the *shape* side, plus one `ShapeCache` doesn't need:
+  an instance graph can point back at itself.** Every `(nested schema,
+  subject)` pair already fully read is cached and reused instead of
+  re-walked (`values.rs`'s `ReadCache`), and a subject already being read
+  higher up the *current* path is a real cycle, not a value to expand again
+  — it's given an empty, identity-only value instead of recursing until
+  `MAX_NESTING_DEPTH` cut it off, which used to read the *same* subject's
+  fields once per depth level, independently, so editing only the
+  outermost copy left every inner copy's stale value still asserted
+  alongside it on save. See `shacl-form-core/tests/opus3_audit.rs`'s
+  `a_self_referencing_instance_subject_does_not_duplicate_its_own_fields`
+  and `mutually_referencing_instance_subjects_do_not_expand_exponentially`
+  (the latter: 1,098,056 entries for eight mutually-cross-referencing
+  subjects without this, well under a fifth of that with it).
+- **A freshly created `Nested` value is given a real, random blank-node
+  identity the moment it exists** (`default_entry`, via
+  `oxrdf::BlankNode::default()`), not left identity-less until
+  serialisation derives one from its position in the tree. A
+  position-derived id can collide with an unrelated, already-real subject a
+  *previous* save happened to mint at that same position (remove an entry,
+  add a new one, and the new one lands where an old, still-referenced
+  identity used to be) — two distinct resources silently merged under one
+  label. See `opus3_audit.rs`'s
+  `a_freshly_added_nested_entry_gets_its_own_identity_immediately_not_derived_from_position`.
 
 ## Requirements
 

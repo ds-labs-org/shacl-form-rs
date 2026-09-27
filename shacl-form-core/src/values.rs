@@ -8,6 +8,7 @@ use oxrdf::{
     BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, SubjectRef, Term, TermRef, TripleRef,
 };
 use oxttl::TurtleSerializer;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// One entry a field holds. A `Select`/`Iri` field holds `Node` when its
@@ -82,39 +83,28 @@ impl FormValues {
     /// and that subject is kept (see [`ValueEntry::Nested`]) so re-saving
     /// an untouched value reproduces it exactly rather than replacing it
     /// with a fresh blank node.
+    ///
+    /// An instance graph is a graph, not a tree: the same subject can be
+    /// reached through more than one path, and — `foaf:knows`-style — can
+    /// point back at one of its own ancestors. Two guards make that safe:
+    /// a subject already being expanded higher up the *current* path is a
+    /// real cycle and is not re-expanded (an empty, otherwise-identity-only
+    /// value instead — the data-driven equivalent of `schema.rs`'s own
+    /// nesting-depth cap, which stops the same recursion from the *shape*
+    /// side); a subject reached again at the same nested schema via a
+    /// *different*, non-ancestor path (any instance with several
+    /// cross-references to the same resource — not necessarily cyclic at
+    /// all) reuses the already-computed [`Rc<FormValues>`] instead of
+    /// re-walking an identical subtree, the same trade [`crate::schema`]'s
+    /// own `ShapeCache` makes for shapes. Without both, a handful of
+    /// mutually cross-referencing subjects (any real "people who know each
+    /// other" instance) expands combinatorially — see
+    /// `shacl-form-core/tests/opus3_audit.rs`.
     pub fn read_from_instance(schema: &FormSchema, graph: &Graph, subject: SubjectRef<'_>) -> Self {
-        let entries = schema
-            .fields
-            .iter()
-            .map(|field| {
-                let Some(path) = &field.path else {
-                    return Rc::from(Vec::new());
-                };
-                let row: Vec<ValueEntry> = graph
-                    .objects_for_subject_predicate(subject, path.as_ref())
-                    .filter_map(|term| match (&field.kind, term) {
-                        (
-                            FieldKind::Nested { schema },
-                            TermRef::NamedNode(_) | TermRef::BlankNode(_),
-                        ) => {
-                            let nested_subject = term_ref_to_subject(term)?;
-                            Some(ValueEntry::Nested {
-                                subject: Some(subject_ref_to_owned(nested_subject)),
-                                values: Rc::new(FormValues::read_from_instance(
-                                    schema,
-                                    graph,
-                                    nested_subject,
-                                )),
-                            })
-                        }
-                        (_, TermRef::Literal(l)) => Some(ValueEntry::Literal(l.into_owned())),
-                        (_, TermRef::NamedNode(n)) => Some(ValueEntry::Node(n.into_owned())),
-                        _ => None,
-                    })
-                    .collect();
-                Rc::from(row)
-            })
-            .collect();
+        let mut cache: ReadCache = HashMap::new();
+        let mut ancestors: HashSet<String> = HashSet::new();
+        ancestors.insert(subject_key(subject));
+        let entries = read_fields(schema, graph, subject, &mut cache, &mut ancestors);
         FormValues { entries }
     }
 
@@ -290,8 +280,21 @@ pub fn literal_entry(field: &Field, lexical: &str) -> ValueEntry {
 /// drift apart.
 pub fn default_entry(field: &Field) -> ValueEntry {
     match &field.kind {
+        // Assigned a real, globally-unique identity right now, at creation
+        // — not left as `None` for `write_triples` to derive one from this
+        // value's position in the tree later. A position-derived id can
+        // collide with a *different*, already-real subject that a previous
+        // save happened to mint at that very label (e.g. this same position,
+        // after an earlier entry there was removed and a new one added) —
+        // silently merging two distinct resources into one. `BlankNode`'s
+        // own random generator (see `oxrdf`) cannot collide with a name any
+        // save has ever produced or any instance could ever have been read
+        // with. `write_triples` still derives a position-based id for a
+        // `None` subject — kept for a value built directly rather than
+        // through this function — solely so *that* narrower case still
+        // serialises identically across repeated unedited calls.
         FieldKind::Nested { schema } => ValueEntry::Nested {
-            subject: None,
+            subject: Some(NamedOrBlankNode::BlankNode(BlankNode::default())),
             values: Rc::new(FormValues::new_for(schema)),
         },
         FieldKind::Select { options } => options
@@ -336,6 +339,100 @@ fn term_to_entry(term: &Term) -> Option<ValueEntry> {
         Term::NamedNode(n) => Some(ValueEntry::Node(n.clone())),
         _ => None,
     }
+}
+
+/// Every `(nested schema, subject)` pair [`read_fields`] has already fully
+/// expanded into an `Rc<FormValues>` — keyed by the schema's own `Rc`
+/// pointer (each nesting *depth* gets its own distinct cached
+/// `Rc<FormSchema>` in `schema.rs`'s `ShapeCache`, so this key, like that
+/// one, is really `(schema, depth, subject)` in effect) so the same subject
+/// reached twice at the same depth is read once and shared, not re-walked.
+type ReadCache = HashMap<(usize, String), Rc<FormValues>>;
+
+fn subject_key(subject: SubjectRef<'_>) -> String {
+    match subject {
+        SubjectRef::NamedNode(n) => n.as_str().to_string(),
+        SubjectRef::BlankNode(b) => format!("_:{}", b.as_str()),
+    }
+}
+
+/// One `FormValues` level's worth of rows, recursing into `read_nested` for
+/// every `Nested` field's value — the part `read_from_instance` and
+/// `read_nested` both need, extracted so the entry point doesn't require an
+/// `Rc<FormSchema>` it may not have (a caller's *root* schema is often a
+/// plain `&FormSchema`; only a `Nested` field's own schema is ever `Rc`'d).
+fn read_fields(
+    schema: &FormSchema,
+    graph: &Graph,
+    subject: SubjectRef<'_>,
+    cache: &mut ReadCache,
+    ancestors: &mut HashSet<String>,
+) -> Vec<Rc<[ValueEntry]>> {
+    schema
+        .fields
+        .iter()
+        .map(|field| {
+            let Some(path) = &field.path else {
+                return Rc::from(Vec::new());
+            };
+            let row: Vec<ValueEntry> = graph
+                .objects_for_subject_predicate(subject, path.as_ref())
+                .filter_map(|term| match (&field.kind, term) {
+                    (
+                        FieldKind::Nested { schema: nested },
+                        TermRef::NamedNode(_) | TermRef::BlankNode(_),
+                    ) => {
+                        let nested_subject = term_ref_to_subject(term)?;
+                        Some(ValueEntry::Nested {
+                            subject: Some(subject_ref_to_owned(nested_subject)),
+                            values: read_nested(nested, graph, nested_subject, cache, ancestors),
+                        })
+                    }
+                    (_, TermRef::Literal(l)) => Some(ValueEntry::Literal(l.into_owned())),
+                    (_, TermRef::NamedNode(n)) => Some(ValueEntry::Node(n.into_owned())),
+                    _ => None,
+                })
+                .collect();
+            Rc::from(row)
+        })
+        .collect()
+}
+
+/// Reads (or reuses the cached read of) one `Nested` field's value.
+/// `ancestors` is the set of subjects currently being expanded somewhere
+/// *above* this call on the current path — reaching one of them again here
+/// is a real cycle (this exact resource nested inside itself, however many
+/// steps removed), not merely "the same subject shared from two unrelated
+/// places", and is not re-expanded: doing so would recurse until
+/// `schema.rs`'s own nesting-depth cap cut it off, producing one
+/// independently-read copy per depth level that can silently disagree with
+/// every other copy of the very same subject once only one of them is
+/// edited (see `opus3_audit.rs`). Once a subject's read is complete it is
+/// removed from `ancestors` (so a sibling branch that is not itself a
+/// cycle can still read it fresh) and, keyed by `(schema, subject)`, kept in
+/// `cache` for the rest of this whole read — reused by every other
+/// occurrence at that same nesting depth instead of re-walked.
+fn read_nested(
+    schema: &Rc<FormSchema>,
+    graph: &Graph,
+    subject: SubjectRef<'_>,
+    cache: &mut ReadCache,
+    ancestors: &mut HashSet<String>,
+) -> Rc<FormValues> {
+    let subject_key = subject_key(subject);
+    if ancestors.contains(&subject_key) {
+        return Rc::new(FormValues::default());
+    }
+    let cache_key = (Rc::as_ptr(schema) as usize, subject_key.clone());
+    if let Some(cached) = cache.get(&cache_key) {
+        return cached.clone();
+    }
+    ancestors.insert(subject_key.clone());
+    let entries = read_fields(schema, graph, subject, cache, ancestors);
+    ancestors.remove(&subject_key);
+    let rc = Rc::new(FormValues { entries });
+    cache.insert(cache_key, rc.clone());
+    rc
 }
 
 fn term_ref_to_subject(term: TermRef<'_>) -> Option<SubjectRef<'_>> {

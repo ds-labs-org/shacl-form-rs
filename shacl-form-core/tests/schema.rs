@@ -44,7 +44,10 @@ fn datatype_maps_to_the_right_field_kind() {
     ));
     assert!(matches!(field("active").kind, FieldKind::Boolean));
     assert!(matches!(field("born").kind, FieldKind::Date));
-    assert!(matches!(field("home").kind, FieldKind::Iri));
+    // xsd:anyURI is a literal datatype (sh:datatype only ever constrains a
+    // literal), not FieldKind::Iri (a resource reference, no datatype) —
+    // see the third audit round's opus3_audit.rs for the case this fixes.
+    assert!(matches!(field("home").kind, FieldKind::Text { .. }));
     assert!(
         schema.all_unsupported().is_empty(),
         "{:?}",

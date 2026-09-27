@@ -885,7 +885,14 @@ fn kind_for_datatype(dt: &NamedNode) -> Option<FieldKind> {
         return Some(FieldKind::DateTime);
     }
     if r == xsd::ANY_URI {
-        return Some(FieldKind::Iri);
+        // xsd:anyURI is a LITERAL datatype ("http://a.example/"^^xsd:anyURI)
+        // — sh:datatype only ever constrains what a literal looks like, per
+        // SHACL/XSD, never whether the value is a literal at all. That's
+        // FieldKind::Iri's job instead (sh:nodeKind sh:IRI, below): a
+        // resource reference, no datatype possible. Mapping sh:datatype
+        // xsd:anyURI to Iri wrote a bare IRI node, which does not conform
+        // to the very sh:datatype constraint that produced the field.
+        return Some(text());
     }
     let integers = [
         xsd::INTEGER,
