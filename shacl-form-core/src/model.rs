@@ -64,8 +64,17 @@ pub enum FieldKind {
     DateTime,
     /// A resource reference with no closed set of options: `sh:nodeKind
     /// sh:IRI`, or `sh:class` naming a class this crate found no matching
-    /// `sh:NodeShape` for (so it cannot offer a nested form or a fixed list).
-    Iri,
+    /// `sh:NodeShape` for (so it cannot offer a nested form or a fixed
+    /// list). `sh:pattern`/`sh:minLength`/`sh:maxLength` apply to an IRI's
+    /// own lexical form just as validly as to a string literal's — an IRI
+    /// is text with syntax rules — so they are carried here exactly like
+    /// `Text`'s own, rather than silently dropped for not being paired with
+    /// `sh:datatype xsd:string`.
+    Iri {
+        patterns: Vec<String>,
+        min_length: Option<u32>,
+        max_length: Option<u32>,
+    },
     /// `sh:in` (a closed enumeration) or `sh:hasValue` (exactly one fixed
     /// value — still an editable `Select` only when `min_count == 0` allows
     /// omitting it; a `sh:hasValue` field with `min_count >= 1` is instead

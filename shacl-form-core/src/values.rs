@@ -3,7 +3,7 @@
 //! was built from; [`FormValues::read_from_instance`] reads it back in from
 //! an existing instance graph, for an edit form rather than a create one.
 use crate::model::{Field, FieldKind, FormSchema};
-use oxrdf::vocab::xsd;
+use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{
     BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, SubjectRef, Term, TermRef, TripleRef,
 };
@@ -258,10 +258,41 @@ impl FormValues {
 /// Padded to `:00` here rather than left for a caller to remember, since
 /// every caller goes through this function.
 pub fn literal_entry(field: &Field, lexical: &str) -> ValueEntry {
+    literal_entry_with_language(field, lexical, None)
+}
+
+/// Like [`literal_entry`], but for a control that knows the language tag of
+/// the value it is replacing (`shacl-form-yew`'s Text control passes
+/// through whatever `render_control`'s own `current` entry already carries)
+/// — a literal's language tag and a `sh:datatype`-stated datatype are
+/// mutually exclusive in RDF (a language-tagged literal's datatype is
+/// always, implicitly, `rdf:langString`), so keeping the tag here, rather
+/// than always minting whichever plain typed literal `field` would
+/// otherwise call for, is what stops editing `"Bonjour"@fr` from silently
+/// producing `"Bonjour!"^^xsd:string`.
+pub fn literal_entry_with_language(
+    field: &Field,
+    lexical: &str,
+    language: Option<&str>,
+) -> ValueEntry {
+    if let Some(lang) = language
+        && !lang.is_empty()
+        && let Ok(lit) = Literal::new_language_tagged_literal(lexical, lang)
+    {
+        return ValueEntry::Literal(lit);
+    }
     let datatype = field
         .original_datatype
         .clone()
         .unwrap_or_else(|| canonical_datatype(&field.kind));
+    if datatype.as_ref() == rdf::LANG_STRING {
+        // rdf:langString has no legal lexical form without a language tag
+        // — writing one anyway is ill-formed RDF. With no tag to keep (a
+        // brand-new value, or an edit that dropped the one it had), fall
+        // back to a plain untyped literal instead of stamping an illegal
+        // datatype on it.
+        return ValueEntry::Literal(Literal::new_simple_literal(lexical));
+    }
     let lexical = if matches!(field.kind, FieldKind::DateTime)
         && lexical.len() == 16
         && lexical.as_bytes().get(10) == Some(&b'T')
@@ -301,7 +332,7 @@ pub fn default_entry(field: &Field) -> ValueEntry {
             .first()
             .map(|o| option_to_entry(&o.value))
             .unwrap_or_else(|| literal_entry(field, "")),
-        FieldKind::Iri => ValueEntry::Node(NamedNode::new_unchecked("")),
+        FieldKind::Iri { .. } => ValueEntry::Node(NamedNode::new_unchecked("")),
         // "" is not a legal xsd:boolean lexical form; a genuinely blank
         // boolean is a checkbox that starts unchecked, i.e. false.
         FieldKind::Boolean => literal_entry(field, "false"),

@@ -3,7 +3,7 @@
 //! recursion into a `Nested` field's own fields. All of that lives in
 //! [`crate::render`], which calls into here once per rendered value.
 use shacl_form_core::oxrdf::{Literal, NamedNode, Term};
-use shacl_form_core::{Field, FieldKind, ValueEntry, literal_entry};
+use shacl_form_core::{Field, FieldKind, ValueEntry, literal_entry, literal_entry_with_language};
 use web_sys::{Event, HtmlInputElement, HtmlSelectElement, MouseEvent};
 use yew::prelude::*;
 
@@ -51,8 +51,18 @@ pub fn render_control(
             max_length,
         } => {
             let field = field.clone();
-            let oninput =
-                onchange.reform(move |e: InputEvent| literal_entry(&field, &input_value(e)));
+            // Captured now, not read from `current` inside the closure —
+            // `current` only borrows for this render, but the closure must
+            // outlive it. Kept so retyping a language-tagged value (e.g.
+            // one read back from an existing instance) doesn't silently
+            // drop its language tag on the very next keystroke.
+            let language = match current {
+                Some(ValueEntry::Literal(l)) => l.language().map(str::to_string),
+                _ => None,
+            };
+            let oninput = onchange.reform(move |e: InputEvent| {
+                literal_entry_with_language(&field, &input_value(e), language.as_deref())
+            });
             html! {
                 <input type="text" value={lexical(current)} oninput={oninput}
                     pattern={combined_pattern(patterns)}
@@ -98,30 +108,50 @@ pub fn render_control(
                 onchange.reform(move |e: InputEvent| literal_entry(&field, &input_value(e)));
             html! { <input type="datetime-local" value={lexical(current)} oninput={oninput} /> }
         }
-        FieldKind::Iri => {
+        FieldKind::Iri {
+            patterns,
+            min_length,
+            max_length,
+        } => {
             let oninput = onchange
                 .reform(|e: InputEvent| ValueEntry::Node(NamedNode::new_unchecked(input_value(e))));
-            html! { <input type="url" value={lexical(current)} oninput={oninput} placeholder="https://…" /> }
+            html! {
+                <input type="url" value={lexical(current)} oninput={oninput} placeholder="https://…"
+                    pattern={combined_pattern(patterns)}
+                    minlength={min_length.map(|n| n.to_string())}
+                    maxlength={max_length.map(|n| n.to_string())} />
+            }
         }
         FieldKind::Select { options } => {
-            let current_str = lexical(current);
+            // Matched by the option's own *index*, not its lexical string:
+            // two `sh:in` terms that stringify the same (`1` and `"1"`, or
+            // `"chat"@fr` and `"chat"@en`) are still different terms, and
+            // used to collide onto whichever one `term_as_string` happened
+            // to compare equal first — both looked selected, and only the
+            // first was ever reachable at all. Comparing the actual `Term`
+            // (datatype/language included) is what tells them apart.
+            let current_term = entry_as_term(current);
+            let selected_idx = options
+                .iter()
+                .position(|o| Some(&o.value) == current_term.as_ref());
             let owned = options.clone();
             // Picking "—" (no selection) must REMOVE this entry, not write
             // one holding an empty literal (`""`) — an empty string is a
             // real, if useless, value, and serialising it satisfies
             // `sh:minCount` for nothing. `select_value` returning "" is
-            // unambiguous here: no real option's own value is ever the
-            // empty string (SHACL's own `sh:in`/`sh:hasValue` terms are
-            // IRIs or non-empty literals), so "the user picked the blank
+            // unambiguous here: the blank option is the only one whose
+            // `value` is ever the empty string (every real option's is now
+            // its index, `"0"`, `"1"`, ...), so "the user picked the blank
             // option" and "onchange somehow got a stray empty string" are
             // the same case and both mean "clear".
             let onselect = Callback::from(move |e: Event| {
                 let chosen = select_value(e);
                 if chosen.is_empty() {
                     on_clear.emit(());
-                } else if let Some(entry) = owned
-                    .iter()
-                    .find(|o| term_as_string(&o.value) == chosen)
+                } else if let Some(entry) = chosen
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|idx| owned.get(idx))
                     .map(|o| term_to_entry(&o.value))
                 {
                     onchange.emit(entry);
@@ -129,10 +159,9 @@ pub fn render_control(
             });
             html! {
                 <select onchange={onselect}>
-                    <option value="" selected={current_str.is_empty()}>{ "—" }</option>
-                    { for options.iter().map(|o| {
-                        let v = term_as_string(&o.value);
-                        html! { <option value={v.clone()} selected={v == current_str}>{ &o.label }</option> }
+                    <option value="" selected={selected_idx.is_none()}>{ "—" }</option>
+                    { for options.iter().enumerate().map(|(idx, o)| {
+                        html! { <option value={idx.to_string()} selected={selected_idx == Some(idx)}>{ &o.label }</option> }
                     }) }
                 </select>
             }
@@ -155,6 +184,17 @@ fn combined_pattern(patterns: &[String]) -> Option<String> {
     }
     let lookaheads: String = patterns.iter().map(|p| format!("(?=.*(?:{p}))")).collect();
     Some(format!("{lookaheads}.*"))
+}
+
+/// A `Select`'s current entry, as the `Term` it was built from — used to
+/// find which option (if any) it matches, by real term equality
+/// (datatype/language included), not by lexical string.
+fn entry_as_term(entry: Option<&ValueEntry>) -> Option<Term> {
+    match entry {
+        Some(ValueEntry::Literal(l)) => Some(Term::Literal(l.clone())),
+        Some(ValueEntry::Node(n)) => Some(Term::NamedNode(n.clone())),
+        _ => None,
+    }
 }
 
 fn term_as_string(term: &Term) -> String {

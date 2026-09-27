@@ -31,7 +31,9 @@ pub use error::ShapesError;
 pub use graph::{parse_instance_turtle, parse_turtle};
 pub use model::{Field, FieldKind, FormSchema, SelectOption};
 pub use schema::{from_shape_iri, from_target_class};
-pub use values::{FormValues, ValueEntry, default_entry, literal_entry};
+pub use values::{
+    FormValues, ValueEntry, default_entry, literal_entry, literal_entry_with_language,
+};
 
 // Re-exported so a caller needn't add oxrdf as a direct dependency just to
 // name a NamedNode/Graph/Term when calling into this crate.

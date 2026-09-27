@@ -77,6 +77,13 @@ see `shacl-form-core/tests/honeycomb.rs`), not just hand-written fixtures.
 | re-saving an untouched value nested under `sh:node`/`sh:class` (edit mode) | reuses the subject it was read from (`ValueEntry::Nested`'s own `subject`); does not replace it with a fresh blank node, and mints the same stable id on repeated `to_turtle` calls for a value that has none yet (a resubmit after a failed save doesn't invent a second resource for the same unsaved value) |
 | `sh:or ()` / `sh:xone ()` (an empty branch list) | reported as unsupported, not silently ignored |
 | an instance subject reachable through its own `sh:node`/`sh:class` nesting again — a self-loop, or a longer cycle (`ex:alice ex:knows ex:alice`, or `A -> B -> A`) | not re-expanded (a real cycle, detected by ancestry on the current read path — its own identity is still kept, just no further fields), and a subject reached again at the same nesting depth via a *different*, non-ancestor path reuses the one already-read `Rc<FormValues>` instead of re-walking it — see `FormValues::read_from_instance`'s own doc comment |
+| `sh:in`/`sh:hasValue` stated alongside `sh:class`/`sh:node` on one property | the nesting still wins (an exact shape is more useful than a fixed list), but the dropped enumeration is named in the field's `unsupported` note, not silently discarded |
+| `sh:pattern`/`sh:hasValue` stated more than once on **one** property shape (legal RDF, unusual SHACL) | every `sh:pattern` value accumulates (the same as two different `sh:and` branches each stating one already did); more than one `sh:hasValue` is noted rather than one being silently kept |
+| `sh:pattern`/`sh:minLength`/`sh:maxLength` on an `Iri` field (`sh:nodeKind sh:IRI`, or a `sh:class` with no matching shape) | applied as the `<input type="url">`'s own `pattern`/`minlength`/`maxlength`, the same as a `Text` field's; on any other kind, where there is genuinely no control to apply them to, named in `unsupported` instead of silently dropped |
+| a numeric bound (`sh:minInclusive` and friends) whose literal isn't itself numeric (paired with `xsd:date`/`xsd:dateTime`, say — a legal pairing this crate's `Date`/`DateTime` controls don't apply a bound to yet) | named in `unsupported` as "stated but not a number this crate can compare against", distinctly from a bound that was never stated at all |
+| a `sh:deactivated` node shape's own `sh:node`/`sh:and` ("shape inheritance") references | not expanded — a deactivated shape contributes nothing at all, not just its own direct `sh:property` list |
+| `sh:datatype rdf:langString` | `Text`, recognised (not reported as an unrecognised datatype); editing a value read with a language tag keeps that tag (`literal_entry_with_language`) rather than silently discarding it for a plain typed literal, and a fresh value with no tag to keep serialises as a plain untyped literal rather than the illegal `"…"^^rdf:langString` |
+| `Select` (`sh:in`/`sh:hasValue`) matching the *current* value to an option, and turning a picked option back into a value | by the option's own index, not its lexical string — two terms that stringify the same (`"chat"@fr` vs `"chat"@en`, or `1` vs `"1"`) are told apart instead of colliding onto one |
 
 Nothing here is silently approximated: a construct this crate can't
 faithfully turn into a control is named in `Field::unsupported` /
@@ -137,32 +144,11 @@ in time proportional to the tree's *distinct* schemas, not to how many
   distinct subject: closing both fully would need the renderer to
   understand "this is the same resource shown twice", which is a bigger,
   separate redesign.
-- Several constraints are silently unenforced (not even noted) when they
-  land next to a different, unrelated one that wins the field's `kind`:
-  `sh:in`/`sh:hasValue` stated alongside `sh:class`/`sh:node` (the nesting
-  wins; the enumeration is dropped); `sh:pattern`/`sh:minLength`/
-  `sh:maxLength` on a property whose kind isn't `Text` (e.g. paired with
-  `sh:nodeKind sh:IRI` or a numeric `sh:datatype`); a numeric
-  `sh:minInclusive`/`sh:maxInclusive`/etc. paired with `xsd:date`/
-  `xsd:dateTime` (silently dropped rather than applied as the control's own
-  `min`/`max`, which HTML's date/datetime-local inputs do support).
-- `sh:pattern` and `sh:hasValue` are read once per property-shape *node*
-  (`object_for_subject_predicate`, not `objects_for_subject_predicate`): a
-  single property shape stating the same predicate more than once (legal
-  RDF, unusual SHACL) has all but one value silently ignored, with no note
-  — unlike two different `sh:and` branches each stating one, which do
-  accumulate.
 - A blank-node-valued property this crate cannot nest (`sh:class` with no
   matching shape, `sh:nodeKind sh:BlankNodeOrIRI`, or a `sh:node`/`sh:class`
   reference past `MAX_NESTING_DEPTH`) is invisible to `read_from_instance`:
   the value is neither shown nor kept, so re-saving an otherwise-untouched
   instance silently drops it rather than round-tripping it unedited.
-- A literal's language tag (`"Bonjour"@fr`) is lost the moment that value is
-  edited (`literal_entry` always builds a typed literal, never a
-  language-tagged one), and `sh:datatype rdf:langString` — common in
-  SKOS/DCAT shapes — is reported as an unrecognised datatype and, if typed
-  into, serialises as `"…"^^rdf:langString`, which is not well-formed RDF
-  (a `rdf:langString` requires a tag).
 - `xsd:dateTimeStamp` (a timezone is mandatory) uses the same
   `datetime-local` control as `xsd:dateTime` (no timezone at all), so an
   edited value is never a legal lexical form for it; reading back an
@@ -176,16 +162,12 @@ in time proportional to the tree's *distinct* schemas, not to how many
   also round-trips exponent notation (`1e5`, which `<input type=number>`
   accepts and returns as-is) as that literal string, which is not a valid
   `xsd:integer`/`xsd:decimal` lexical form.
-- `Select`'s options are matched by their lexical string alone
-  (`controls.rs`'s `term_as_string`), not datatype or language: two
-  `sh:in` values that stringify the same (`"1"` and `1`, or `"chat"@fr` and
-  `"chat"@en`) collide onto one selectable option, and a current or default
-  value that isn't among the options at all displays as unselected ("—")
-  while still being submitted unchanged if the field is never touched.
-- A `sh:deactivated` node shape is itself skipped, but its own `sh:node`/
-  `sh:and` references are still expanded into the merged shape set before
-  that filter runs — a deactivated shape's *inherited* properties still
-  show up even though the shape stating them does not.
+- A current or default `Select` value that isn't among the field's own
+  options at all (an instance written by something else, or a
+  `sh:defaultValue` outside `sh:in`) still displays as unselected ("—")
+  while being submitted unchanged if the field is never touched — matching
+  by the option's own index (see the coverage table) tells two *listed*
+  options apart but doesn't invent one for a value that isn't listed.
 
 ## Design notes (why it's built this way)
 

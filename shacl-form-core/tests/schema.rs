@@ -128,7 +128,7 @@ fn sh_class_with_no_matching_shape_falls_back_to_a_plain_iri_field_and_says_so()
           sh:property [ sh:path ex:manager ; sh:class ex:Person ] .
         "#,
     );
-    assert!(matches!(schema.fields[0].kind, FieldKind::Iri));
+    assert!(matches!(schema.fields[0].kind, FieldKind::Iri { .. }));
     assert!(
         schema.fields[0]
             .unsupported

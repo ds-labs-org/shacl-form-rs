@@ -95,6 +95,95 @@ async fn typing_a_name_and_submitting_emits_it_as_turtle() {
     document().body().unwrap().remove_child(&container).unwrap();
 }
 
+const SELECT_SHAPES: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix ex: <http://example.org/> .
+ex:S a sh:NodeShape ;
+  sh:property [ sh:path ex:choice ; sh:name "Choice" ; sh:in ( "chat"@fr "chat"@en ) ] .
+"#;
+
+/// Known-limitations pass: two `sh:in` terms that stringify identically
+/// but are different terms (here, the same word tagged `@fr` vs `@en`)
+/// used to be indistinguishable to the rendered `<select>` — matched by
+/// lexical string alone, so the *second* option could never actually be
+/// selected (picking it in the DOM still resolved back to the first). This
+/// reproduces the exact user-facing symptom: read an instance whose value
+/// is the *second* option, confirm the DOM shows the second `<option>`
+/// selected (not the first, which the old lexical-only match would show
+/// regardless of the real value), then pick the *first* option and submit,
+/// confirming the *first* term's own language tag makes it to the output —
+/// proving both reading and writing tell the two options apart.
+#[wasm_bindgen_test]
+async fn two_sh_in_options_with_the_same_lexical_string_are_told_apart() {
+    let container: Element = document().create_element("div").unwrap();
+    document().body().unwrap().append_child(&container).unwrap();
+
+    let received: Rc<RefCell<Option<AttrValue>>> = Rc::new(RefCell::new(None));
+    let onsubmit = {
+        let received = received.clone();
+        Callback::from(move |turtle: AttrValue| *received.borrow_mut() = Some(turtle))
+    };
+    let props = ShaclFormProps {
+        shapes_ttl: AttrValue::from(SELECT_SHAPES),
+        target: Target::ShapeIri(AttrValue::from("http://example.org/S")),
+        instance_ttl: Some(AttrValue::from(
+            r#"@prefix ex: <http://example.org/> . ex:x ex:choice "chat"@en ."#,
+        )),
+        instance_subject_iri: Some(AttrValue::from("http://example.org/x")),
+        new_subject_iri: None,
+        onsubmit,
+    };
+    let _handle =
+        yew::Renderer::<ShaclForm>::with_root_and_props(container.clone(), props).render();
+    settle().await;
+    settle().await;
+
+    let select = container
+        .query_selector("select")
+        .unwrap()
+        .expect("the Choice field rendered a select")
+        .dyn_into::<web_sys::HtmlSelectElement>()
+        .unwrap();
+    let option_count = container.query_selector_all("option").unwrap().length();
+    assert_eq!(option_count, 3, "blank + two real options");
+    assert_eq!(
+        select.value(),
+        "1",
+        "the instance's own value is the @en option (internal index 1) — the @fr option \
+         (index 0) must not appear selected just because it stringifies the same"
+    );
+
+    // Now pick the FIRST real option (@fr, value "0") and submit.
+    select.set_value("0");
+    select
+        .dispatch_event(&web_sys::Event::new("change").unwrap())
+        .unwrap();
+    settle().await;
+
+    let form = container
+        .query_selector("form")
+        .unwrap()
+        .expect("the form rendered")
+        .dyn_into::<web_sys::HtmlFormElement>()
+        .unwrap();
+    form.request_submit().unwrap();
+    settle().await;
+    settle().await;
+
+    let turtle = received.borrow().clone().expect("onsubmit must have fired");
+    assert!(
+        turtle.contains("\"chat\"@fr"),
+        "picking the @fr option must submit the @fr term, not the @en one it used to fall back \
+         to:\n{turtle}"
+    );
+    assert!(
+        !turtle.contains("\"chat\"@en"),
+        "the old @en value must not still be asserted once @fr was chosen:\n{turtle}"
+    );
+
+    document().body().unwrap().remove_child(&container).unwrap();
+}
+
 const TWO_FIELD_SHAPES: &str = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .

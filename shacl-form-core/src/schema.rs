@@ -151,6 +151,20 @@ fn expand_shape_refs(graph: &Graph, seed: Vec<Subject>) -> Vec<Subject> {
         if !visited.insert(shape_key(s.as_ref())) {
             continue;
         }
+        result.push(s.clone());
+        // A deactivated shape contributes nothing — including what it
+        // would otherwise have inherited. Its own sh:property list is
+        // already excluded later (walk_shapes filters `expanded` on this
+        // same predicate), but without this check its sh:node/sh:and
+        // targets were still followed and merged in: switching a shape off
+        // stopped its own properties from showing up, but not the
+        // properties it names as inherited on its behalf.
+        if graph
+            .object_for_subject_predicate(s.as_ref(), sh::DEACTIVATED)
+            .is_some_and(is_true)
+        {
+            continue;
+        }
         if let Some(n) = graph.object_for_subject_predicate(s.as_ref(), sh::NODE)
             && let Some(sub) = as_subject_term(&n.into_owned())
         {
@@ -163,7 +177,6 @@ fn expand_shape_refs(graph: &Graph, seed: Vec<Subject>) -> Vec<Subject> {
                 }
             }
         }
-        result.push(s);
     }
     result
 }
@@ -440,6 +453,22 @@ fn build_field(graph: &Graph, members: &[Subject], depth: u32, cache: &mut Shape
 
     let original_datatype = acc.datatype.clone();
     let kind = resolve_kind(graph, &acc, depth, cache, &mut unsupported);
+    // sh:pattern/sh:minLength/sh:maxLength apply to a Text or an Iri
+    // control (both are, structurally, "a lexical form with syntax
+    // rules") — every other kind (Number, Boolean, Date, DateTime, Select,
+    // Nested) has no rendered attribute for them at all, and used to drop
+    // them with no trace whenever the field's kind was decided by
+    // something else (sh:datatype xsd:integer, sh:in, sh:class, ...).
+    // Checked once here, after `kind` is fully decided, rather than at each
+    // of `resolve_kind`'s several early-return sites.
+    if !matches!(kind, FieldKind::Text { .. } | FieldKind::Iri { .. })
+        && (!acc.patterns.is_empty() || acc.min_length.is_some() || acc.max_length.is_some())
+    {
+        unsupported.push(
+            "sh:pattern/sh:minLength/sh:maxLength are stated but this field's kind has no control to apply them to — not enforced"
+                .to_string(),
+        );
+    }
 
     Field {
         path,
@@ -503,8 +532,15 @@ fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc, combi
         &mut acc.unsupported,
     );
 
-    if let Some(p) = literal_string(graph.object_for_subject_predicate(node, sh::PATTERN)) {
-        acc.patterns.push(p);
+    // `objects_for_subject_predicate`, not `object_for_subject_predicate`:
+    // a single property shape stating `sh:pattern` more than once (legal
+    // RDF — a node can have several objects for one predicate) must have
+    // every one of them enforced, the same as two different `sh:and`
+    // branches each stating one already did.
+    for p in graph.objects_for_subject_predicate(node, sh::PATTERN) {
+        if let Some(p) = literal_string(Some(p)) {
+            acc.patterns.push(p);
+        }
     }
     if graph
         .object_for_subject_predicate(node, sh::FLAGS)
@@ -524,30 +560,42 @@ fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc, combi
     {
         acc.max_length = Some(acc.max_length.map_or(n, |e| e.min(n)));
     }
-    if let Some(n) = graph
-        .object_for_subject_predicate(node, sh::MIN_INCLUSIVE)
-        .and_then(literal_f64)
-    {
-        acc.min_inclusive = Some(acc.min_inclusive.map_or(n, |e| e.max(n)));
-    }
-    if let Some(n) = graph
-        .object_for_subject_predicate(node, sh::MAX_INCLUSIVE)
-        .and_then(literal_f64)
-    {
-        acc.max_inclusive = Some(acc.max_inclusive.map_or(n, |e| e.min(n)));
-    }
-    if let Some(n) = graph
-        .object_for_subject_predicate(node, sh::MIN_EXCLUSIVE)
-        .and_then(literal_f64)
-    {
-        acc.min_exclusive = Some(acc.min_exclusive.map_or(n, |e| e.max(n)));
-    }
-    if let Some(n) = graph
-        .object_for_subject_predicate(node, sh::MAX_EXCLUSIVE)
-        .and_then(literal_f64)
-    {
-        acc.max_exclusive = Some(acc.max_exclusive.map_or(n, |e| e.min(n)));
-    }
+    read_numeric_bound(
+        graph,
+        node,
+        sh::MIN_INCLUSIVE,
+        "sh:minInclusive",
+        &mut acc.min_inclusive,
+        f64::max,
+        &mut acc.unsupported,
+    );
+    read_numeric_bound(
+        graph,
+        node,
+        sh::MAX_INCLUSIVE,
+        "sh:maxInclusive",
+        &mut acc.max_inclusive,
+        f64::min,
+        &mut acc.unsupported,
+    );
+    read_numeric_bound(
+        graph,
+        node,
+        sh::MIN_EXCLUSIVE,
+        "sh:minExclusive",
+        &mut acc.min_exclusive,
+        f64::max,
+        &mut acc.unsupported,
+    );
+    read_numeric_bound(
+        graph,
+        node,
+        sh::MAX_EXCLUSIVE,
+        "sh:maxExclusive",
+        &mut acc.max_exclusive,
+        f64::min,
+        &mut acc.unsupported,
+    );
     if let Some(head) = graph.object_for_subject_predicate(node, sh::IN) {
         let list = rdf_list(graph, head);
         match &acc.in_list {
@@ -558,10 +606,20 @@ fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc, combi
                 .push("sh:and combines conflicting sh:in lists; keeping the first".to_string()),
         }
     }
-    if let Some(v) = graph
-        .object_for_subject_predicate(node, sh::HAS_VALUE)
-        .map(TermRef::into_owned)
-    {
+    let mut has_value_here = graph
+        .objects_for_subject_predicate(node, sh::HAS_VALUE)
+        .map(TermRef::into_owned);
+    if let Some(v) = has_value_here.next() {
+        // More than one sh:hasValue on ONE property shape means "must have
+        // every one of these values" (a repeatable-property idiom), not
+        // "any one of them" — this crate models sh:hasValue as a single
+        // fixed Select option, so it can't honour "all of several required
+        // values" at all. Reported rather than silently keeping an
+        // arbitrary one, the same as sh:or's own "more branches than this
+        // field can reflect" note.
+        if has_value_here.next().is_some() {
+            acc.unsupported.push("sh:hasValue states more than one required value on a single property shape; only one is reflected as this field's fixed option".to_string());
+        }
         match &acc.has_value {
             None => acc.has_value = Some(v),
             Some(existing) if existing == &v => {}
@@ -657,6 +715,29 @@ fn resolve_kind(
     cache: &mut ShapeCache,
     unsupported: &mut Vec<String>,
 ) -> FieldKind {
+    // sh:node/sh:class wins the field's own kind (a value that is itself
+    // shaped is more useful nested than flattened into a fixed list), but
+    // an enumeration stated alongside it is a real constraint this crate
+    // then does not enforce at all — silently, until this note. Checked
+    // before either nesting branch below, since both return early.
+    if (acc.node.is_some() || acc.class.is_some())
+        && (acc.in_list.is_some() || acc.has_value.is_some())
+    {
+        let which = match (acc.in_list.is_some(), acc.has_value.is_some()) {
+            (true, true) => "sh:in and sh:hasValue are",
+            (true, false) => "sh:in is",
+            (false, true) => "sh:hasValue is",
+            (false, false) => unreachable!(),
+        };
+        unsupported.push(format!(
+            "{which} stated alongside sh:node/sh:class; nesting wins, {} not enforced",
+            if acc.in_list.is_some() && acc.has_value.is_some() {
+                "neither is"
+            } else {
+                "it is"
+            }
+        ));
+    }
     if let Some(node) = &acc.node {
         return match as_subject_term(node) {
             Some(subject) => {
@@ -701,7 +782,7 @@ fn resolve_kind(
                 "no shape has sh:targetClass <{}>; rendered as a plain IRI field",
                 class.as_str()
             ));
-            return FieldKind::Iri;
+            return plain_iri();
         }
         return nest_shapes(
             graph,
@@ -725,7 +806,11 @@ fn resolve_kind(
     if let Some(nk) = &acc.node_kind {
         let r = nk.as_ref();
         if r == sh::IRI {
-            return FieldKind::Iri;
+            // apply_text_constraints, not a bare FieldKind::Iri: an IRI's
+            // own lexical form is exactly as valid a target for
+            // sh:pattern/sh:minLength/sh:maxLength as a string literal's —
+            // dropped here previously with no note at all.
+            return apply_text_constraints(acc, plain_iri());
         }
         if r == sh::LITERAL {
             // The expected/common case alongside sh:datatype — nothing to add.
@@ -792,7 +877,7 @@ fn nest_shapes(
 ) -> FieldKind {
     if depth >= MAX_NESTING_DEPTH {
         unsupported.push(format!("nesting stopped at depth {MAX_NESTING_DEPTH}"));
-        return FieldKind::Iri;
+        return plain_iri();
     }
     FieldKind::Nested {
         schema: walk_shapes(graph, shapes, target_class, depth + 1, cache),
@@ -801,7 +886,15 @@ fn nest_shapes(
 
 fn fallback_iri(unsupported: &mut Vec<String>, reason: String) -> FieldKind {
     unsupported.push(reason);
-    FieldKind::Iri
+    plain_iri()
+}
+
+fn plain_iri() -> FieldKind {
+    FieldKind::Iri {
+        patterns: Vec::new(),
+        min_length: None,
+        max_length: None,
+    }
 }
 
 /// Turns SHACL's `sh:minExclusive`/`sh:maxExclusive` into the inclusive
@@ -851,6 +944,11 @@ fn apply_text_constraints(acc: &Acc, kind: FieldKind) -> FieldKind {
             min_length: acc.min_length,
             max_length: acc.max_length,
         },
+        FieldKind::Iri { .. } => FieldKind::Iri {
+            patterns: acc.patterns.clone(),
+            min_length: acc.min_length,
+            max_length: acc.max_length,
+        },
         other => other,
     }
 }
@@ -873,6 +971,17 @@ fn kind_for_datatype(dt: &NamedNode) -> Option<FieldKind> {
     ]
     .contains(&r)
     {
+        return Some(text());
+    }
+    if r == rdf::LANG_STRING {
+        // rdf:langString IS a recognised datatype (SKOS/DCAT shapes state
+        // it routinely) — mapping it to the fallback "unrecognised"
+        // Text control would falsely claim this crate doesn't know what it
+        // is. It renders the same as any other Text field; what's actually
+        // special about it (its lexical form requires a language tag,
+        // which this crate's controls have no dedicated input for yet) is
+        // handled at serialisation, in `values.rs`'s
+        // `literal_entry_with_language`, not here.
         return Some(text());
     }
     if r == xsd::BOOLEAN {
@@ -1022,6 +1131,37 @@ fn literal_f64(term: TermRef<'_>) -> Option<f64> {
     match term {
         TermRef::Literal(l) => l.value().parse().ok(),
         _ => None,
+    }
+}
+
+/// Reads one numeric-bound predicate (`sh:minInclusive` and friends) off
+/// `node`, tightening `slot` the way `collect_constraints` already merges
+/// every other constraint. A bound whose literal genuinely isn't numeric —
+/// a legal pairing (`sh:minInclusive "2000-01-01"^^xsd:date` alongside
+/// `xsd:date`, say) this crate's controls just don't apply yet — used to
+/// vanish silently at this exact step (`literal_f64` returning `None` looks
+/// identical to "no such triple at all"). Distinguished here: the predicate
+/// being *present but unparsed* is reported, so a reader can at least tell
+/// "this crate saw a constraint it couldn't use" from "there was nothing to
+/// see".
+#[allow(clippy::too_many_arguments)]
+fn read_numeric_bound(
+    graph: &Graph,
+    node: SubjectRef<'_>,
+    pred: NamedNodeRef<'_>,
+    label: &str,
+    slot: &mut Option<f64>,
+    tighten: impl Fn(f64, f64) -> f64,
+    unsupported: &mut Vec<String>,
+) {
+    let Some(term) = graph.object_for_subject_predicate(node, pred) else {
+        return;
+    };
+    match literal_f64(term) {
+        Some(n) => *slot = Some(slot.map_or(n, |e| tighten(e, n))),
+        None => unsupported.push(format!(
+            "{label} is stated but its value is not a number this crate can compare against — not applied"
+        )),
     }
 }
 
