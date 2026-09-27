@@ -1,0 +1,30 @@
+[package]
+name = "shacl-form-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reads an arbitrary SHACL shapes graph and produces a FormSchema an HTML form can be built from; serialises the filled-in form back to conforming RDF. No UI framework."
+keywords = ["shacl", "rdf", "turtle", "form", "sparql"]
+categories = ["data-structures", "encoding"]
+readme = "../README.md"
+
+# Real RDF, not hand-rolled: see the workspace README's "Why a real RDF crate"
+# section. oxrdf is the term/graph model, oxttl the Turtle reader/writer -- both
+# from the oxigraph project, neither pulling in the SPARQL engine or the actual
+# oxigraph store.
+[dependencies]
+oxrdf = "0.2"
+oxttl = "0.1"
+thiserror = "2"
+
+# getrandom's default backend has no wasm32-unknown-unknown support at all (it
+# needs an OS RNG syscall that target doesn't have); the "js" feature switches
+# it to calling crypto.getRandomValues through wasm-bindgen, which is exactly
+# what a browser-hosted caller of this crate already has. Gated to wasm32 only
+# so a host-side (non-browser) consumer of this crate pulls no JS-glue
+# dependency at all -- verified against a throwaway `cargo check --target
+# wasm32-unknown-unknown` spike before choosing oxrdf/oxttl over a hand-rolled
+# parser; see the workspace README for what that spike ruled out.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

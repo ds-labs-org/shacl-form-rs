@@ -1,0 +1,84 @@
+# The gate on a CHANGE, as distinct from pages.yml's gate on a DEPLOY. Same
+# split ds-honeycomb-editor-rs uses, for the same reason: pages.yml fires only
+# on a push to main behind a path filter, so a pull request or a push to any
+# other branch runs nothing at all without this file.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything that runs on the host — everything except the real-browser
+  # suite. Split from `browser` below so fast feedback isn't queued behind a
+  # wasm toolchain download.
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # --all-targets so tests are linted too. NOTE this does not lint
+      # shacl-form-yew/tests/dom.rs, which is `#![cfg(target_arch = "wasm32")]`
+      # and compiles to an empty module on the host — the `browser` job below
+      # lints it against the target it's actually written for.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # shacl-form-core's own test suite, including tests/honeycomb.rs against
+      # the vendored ds-honeycomb-editor-rs shapes.ttl fixture — a real, dense
+      # shapes graph this crate did not write.
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # shacl-form-yew/tests/dom.rs mounts the real component in a real browser
+  # and drives it end to end (type into a rendered control, submit, read the
+  # Turtle emitted) — the one thing `cargo test --workspace` on the host
+  # cannot exercise, since that file compiles to an empty binary there.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.129
+
+      - name: Clippy (wasm32)
+        run: cargo clippy -p shacl-form-yew -p demo --target wasm32-unknown-unknown --features csr --all-targets --locked -- -D warnings
+
+      # `--test '*'`, not a list of names: a new file under tests/ is covered
+      # the moment it exists, the same discipline ds-honeycomb-editor-rs's own
+      # CI names as hard-won (a test file that ran zero times because a bare
+      # `cargo test -p ... --target wasm32-unknown-unknown` also picks up the
+      # --lib target and dies on `Exec format error` first).
+      - name: Browser tests
+        run: |
+          set -euo pipefail
+          if [ -n "${CHROMEWEBDRIVER:-}" ] && [ -x "${CHROMEWEBDRIVER}/chromedriver" ]; then
+            export CHROMEDRIVER="${CHROMEWEBDRIVER}/chromedriver"
+          else
+            export CHROMEDRIVER="$(command -v chromedriver)"
+          fi
+          echo "chromedriver: ${CHROMEDRIVER}"
+          cargo test -p shacl-form-yew --target wasm32-unknown-unknown --features csr --locked --test '*'

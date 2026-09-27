@@ -1,0 +1,36 @@
+[package]
+name = "shacl-form-yew"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A Yew component that renders a shacl-form-core FormSchema as a real HTML form and emits the filled-in RDF instance data"
+keywords = ["yew", "shacl", "rdf", "form", "component"]
+categories = ["gui", "wasm"]
+readme = "../README.md"
+
+# The same dependency floor honeycomb-yew states for itself: no CSS
+# framework, no npm. The host supplies class names (see `classes` on
+# `ShaclFormProps`); this crate supplies behaviour.
+[dependencies]
+shacl-form-core = { path = "../shacl-form-core", version = "0.1.0" }
+yew = { version = "0.23", default-features = false }
+web-sys = { version = "0.3", features = [
+    "HtmlInputElement", "HtmlSelectElement", "HtmlTextAreaElement",
+    "Event", "InputEvent", "SubmitEvent",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
+[features]
+default = []
+csr = ["yew/csr"]
+ssr = ["yew/ssr"]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+yew = { version = "0.23", features = ["csr"] }
+gloo-timers = { version = "0.3", features = ["futures"] }
+web-sys = { version = "0.3", features = ["HtmlFormElement"] }
+wasm-bindgen = "0.2"

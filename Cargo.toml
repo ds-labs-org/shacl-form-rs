@@ -1,0 +1,29 @@
+# Workspace for ds-shacl-form-rs.
+#
+# Two crates plus a demo, and the split mirrors ds-honeycomb-editor-rs's own
+# for the same reason:
+#
+#   shacl-form-core   parses a SHACL shapes graph (real Turtle, via oxrdf/
+#                     oxttl -- see the README's "Why a real RDF crate" section
+#                     for why this repo does NOT hand-roll a parser the way
+#                     honeycomb-core does) into a FormSchema, and serialises a
+#                     filled-in form back out to conforming RDF instance data.
+#                     No UI framework at all, so a host-side generator could
+#                     use it without linking yew.
+#   shacl-form-yew    the component: renders a FormSchema as real form
+#                     controls, collects edits, reports SHACL validation
+#                     errors as the user types.
+#   demo              the Trunk app: paste a shapes graph, pick a target
+#                     shape, get a live form and the Turtle it produces.
+#
+# demo-ssg (a host-only static pre-render, the way ds-honeycomb-editor-rs has
+# one) is deliberately not included yet -- see the README's "Not done" section.
+[workspace]
+resolver = "2"
+members = ["shacl-form-core", "shacl-form-yew", "demo"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ds-labs-org/ds-shacl-form-rs"

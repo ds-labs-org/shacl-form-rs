@@ -1,0 +1,107 @@
+# Mirrors ds-labs-org's established Pages pattern (ds-honeycomb-editor-rs,
+# ds-odrl-compliance-rdf, ds-odrl-engine-rs all deploy this way): same pinned
+# action and toolchain versions, build_type "workflow". Matching the house
+# beats being current.
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "demo/**"
+      - "shacl-form-core/**"
+      - "shacl-form-yew/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.22.0-beta.2
+
+      # shacl-form-core's own suite, including tests/honeycomb.rs against the
+      # vendored ds-honeycomb-editor-rs shapes.ttl fixture. Cheap, and it gates
+      # the deploy the same way pages.yml's own Test step always has upstream.
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # --public-url is what makes this work as a PROJECT page: without it
+      # Trunk emits asset URLs rooted at "/", so the browser requests
+      # ds-labs-org.github.io/<hash>.js instead of
+      # ds-labs-org.github.io/shacl-form-rs/<hash>.js — 404, a page that loads
+      # but never boots. It also feeds index.html's own
+      # `<base data-trunk-public-url />`.
+      - name: Build demo
+        working-directory: demo
+        run: trunk build --release --public-url /shacl-form-rs/
+
+      # The wasm mounts into a plain empty <div id="app"> (no build-time
+      # static generation here, unlike ds-honeycomb-editor-rs's demo-ssg — see
+      # the README's "Not done" note), so the one failure worth catching
+      # before a visitor does is the wasm not booting at all, which is silent
+      # in the window otherwise.
+      - name: Smoke-test that the wasm boots
+        working-directory: demo
+        run: |
+          set -euo pipefail
+          if ! command -v chromium >/dev/null 2>&1; then
+            echo "::notice::chromium not on this runner - skipping the boot check"
+            exit 0
+          fi
+          mkdir -p _smoke/shacl-form-rs
+          cp -r dist/* _smoke/shacl-form-rs/
+          (cd _smoke && python3 -m http.server 8732 >/dev/null 2>&1) &
+          for _ in $(seq 1 20); do
+            curl -sf -o /dev/null http://127.0.0.1:8732/shacl-form-rs/ && break
+            sleep 0.5
+          done
+          chromium --headless --disable-gpu --no-sandbox --enable-logging=stderr \
+            --virtual-time-budget=8000 \
+            --dump-dom http://127.0.0.1:8732/shacl-form-rs/ \
+            >_smoke/dom.html 2>_smoke/console.log || true
+          if grep -qE "panicked at|RuntimeError: unreachable" _smoke/console.log; then
+            echo "::error::the wasm panicked on boot"
+            grep -E "panicked at|RuntimeError" -A5 _smoke/console.log | head -40
+            exit 1
+          fi
+          if ! grep -q 'shacl-form-rs demo' _smoke/dom.html; then
+            echo "::error::the page never rendered its own title - the wasm did not mount"
+            exit 1
+          fi
+          echo "wasm boot OK"
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: demo/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

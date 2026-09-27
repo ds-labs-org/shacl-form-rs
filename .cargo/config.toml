@@ -1,0 +1,8 @@
+# A wasm test binary cannot be executed; it has to be handed to a browser.
+# Same runner ds-honeycomb-editor-rs pins, for the same reason: naming it here
+# rather than leaving it to CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER in
+# somebody's shell is what makes shacl-form-yew/tests/*.rs runnable by someone
+# who has just cloned the repository. The runner comes from wasm-bindgen-cli
+# and its version must match the wasm-bindgen in Cargo.lock.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

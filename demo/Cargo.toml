@@ -1,0 +1,22 @@
+[package]
+name = "demo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Demo page for shacl-form-rs: paste a SHACL shapes graph, pick a target shape, get a live form and the Turtle it produces"
+publish = false
+
+[lib]
+name = "demo"
+path = "src/lib.rs"
+
+[[bin]]
+name = "demo"
+path = "src/main.rs"
+
+[dependencies]
+shacl-form-yew = { path = "../shacl-form-yew", features = ["csr"] }
+shacl-form-core = { path = "../shacl-form-core" }
+yew = { version = "0.23", features = ["csr"] }
+web-sys = { version = "0.3", features = ["HtmlTextAreaElement", "HtmlInputElement", "HtmlSelectElement", "Window", "Document", "Element"] }

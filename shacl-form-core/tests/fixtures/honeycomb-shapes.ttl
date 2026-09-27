@@ -1,0 +1,783 @@
+@prefix hsh:  <https://semantic.ds-labs.org/shapes/honeycomb#> .
+@prefix hive: <https://semantic.ds-labs.org/vocab/honeycomb#> .
+@prefix sh:   <http://www.w3.org/ns/shacl#> .
+@prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:  <http://www.w3.org/2001/XMLSchema#> .
+@prefix dct:  <http://purl.org/dc/terms/> .
+
+#################################################################
+# The SHACL contract for the honeycomb diagram vocabulary.
+#
+# WHAT IS ENFORCED WHERE, STATED SO A READER DOES NOT ASSUME MORE. The owning
+# crate asserts these invariants in Rust, where most of them are unrepresentable
+# rather than merely checked. This file restates the same contract for graph
+# consumers - a hand-edited file, a file written by another tool, a file that
+# arrived through a pull request. The only place it runs against a real corpus is
+# a consumer's own validation gate; upstream CI runs it over a handful of
+# committed fixtures and asserts this file's own meta-properties.
+#
+# FOUR CONVENTIONS, EACH OF WHICH IS A BUG SOMEBODY ALREADY HIT.
+#
+# 1. ONE NODE-LEVEL CONSTRAINT PER NODE SHAPE. A node shape's sh:message is
+#    copied onto every result its NODE-LEVEL constraints produce - sh:closed,
+#    sh:xone, sh:sparql. A shape carrying two of them prints one message for two
+#    different failures, and one of the two is then wrong. hsh:PlacementShape
+#    therefore owns sh:closed and nothing else, and the mutual exclusion lives in
+#    its own shape, hsh:PlacementDrawsOneThing.
+#
+# 2. EVERY NODE THAT STATES A CONSTRAINT CARRIES AN sh:message, INCLUDING FOUR
+#    THAT CAN NEVER BE SHOWN. The four nested property shapes inside
+#    hsh:PlacementDrawsOneThing's sh:xone list are unreachable: pyshacl reports a
+#    single result at the enclosing sh:xone and the inner messages are never
+#    evaluated. They are written anyway because a consumer gate walks the shapes
+#    graph for nodes carrying a core constraint parameter, and exempts only the
+#    xone MEMBERS themselves - a nested property shape is one hop further out and
+#    carries sh:minCount / sh:maxCount. Omitting them is four violations in the
+#    gate, in the worst possible place: inside bytes a consumer has vendored and
+#    cannot edit. The irony is worth writing down rather than hiding: a rule whose
+#    purpose is that every message shown is readable requires four messages that
+#    are not.
+#
+# 3. sh:severity GOES ON THE SHAPE, NEVER INSIDE AN sh:SPARQLConstraint, where it
+#    is silently ignored and the rule reports as a Violation. hsh:GroupsDoNotTouch
+#    is the only Warning here and it must stay one.
+#
+# 4. MESSAGES ARE rule: / why: / fix:. rule: names the invariant, why: names the
+#    failure it prevents, fix: says what to type. A contributor who has never read
+#    SHACL must be able to act on the message alone.
+#
+# A COUPLING WORTH KNOWING BEFORE YOU EDIT. sh:closed counts only the sh:path
+# values of the property shapes of THE SAME node shape. The hive:represents and
+# hive:tile paths inside hsh:PlacementDrawsOneThing's sh:xone contribute nothing
+# to hsh:PlacementShape's closedness - it admits them only because
+# hsh:PlacementShape declares both paths itself. Adding a path to the xone side
+# alone makes hsh:PlacementShape reject it with the anti-drift message, which
+# would read as nonsense. Add paths to both, or to neither.
+#
+# NO CONTIGUITY SHAPE, DELIBERATELY. Transitive closure over a lattice is not
+# something SPARQL should be asked to do, and a fractured group is a legitimate
+# drawing: an editor that permits regrouping must permit the transiently split
+# state between pulling a member out and putting it back. It is computed in the
+# component and reported in the interface.
+#
+# WHERE A LANGUAGE TAG IS ALLOWED, WHICH THIS FILE ALREADY DECIDES WITHOUT EVER
+# USING THE WORD. A language-tagged literal has datatype rdf:langString, so a
+# property shape carrying sh:datatype xsd:string REJECTS one and a property
+# shape carrying no sh:datatype at all ACCEPTS one. That is not a subtlety this
+# file may leave implicit any more: rdfs:label is constrained here with
+# sh:minLength and deliberately no datatype on all four of hsh:DiagramShape,
+# hsh:TileShape, hsh:GroupShape and hsh:LinkShape, and rdfs:comment carries no
+# property shape at all - so "Plan de la mairie"@fr conforms, and the owning
+# crate now carries the tag through its model and writes it back. Every other
+# string-valued property here - hive:slug, hive:note, hive:generator,
+# hive:pinnedRevision, hive:formatVersion, and hive:generatedAt with
+# xsd:dateTime - pins a datatype, so a tag on one of those is a document THIS
+# FILE rejects, and the crate refuses it by name rather than silently dropping
+# the tag and writing back something the author did not write.
+#
+# SO ADDING OR REMOVING AN sh:datatype ON A STRING PROPERTY IS A DECISION ABOUT
+# LANGUAGES, whether or not whoever makes it is thinking about languages.
+# hive:note is the live example: it is prose printed under a heading and a
+# perfectly reasonable thing to want in French, and it cannot carry a tag today
+# because BOTH this file and ns.ttl's own rdfs:range say xsd:string. Relaxing
+# that is a vocabulary change - a new owl:versionInfo here, a new rdfs:range in
+# ns.ttl and ns, and hive:tboxVersion with them - and not something a reader or
+# a writer may decide on its own.
+#
+# THERE IS NO @base HERE, for the same reason there is none in the vocabulary: a
+# consumer that vendors a copy prepends its own, and that stays a prepend only
+# because this file declares none and contains zero relative IRI refs.
+#################################################################
+
+<https://semantic.ds-labs.org/shapes/honeycomb> a owl:Ontology ;
+  dct:title "SHACL shapes for the honeycomb diagram vocabulary"@en ;
+  rdfs:seeAlso <https://github.com/ds-labs-org/ds-honeycomb-editor-rs> ;
+  owl:versionInfo "0.3.0" ;
+  # The prefix map every sh:SPARQLConstraint below resolves its names against.
+  # Written out rather than assumed: a SPARQL constraint whose prefix is not
+  # declared here does not fail loudly, it fails at parse time inside the
+  # validator with a message that names no shape.
+  sh:declare
+    [ sh:prefix "hive" ; sh:namespace "https://semantic.ds-labs.org/vocab/honeycomb#"^^xsd:anyURI ] ,
+    [ sh:prefix "rdf"  ; sh:namespace "http://www.w3.org/1999/02/22-rdf-syntax-ns#"^^xsd:anyURI ] ,
+    [ sh:prefix "rdfs" ; sh:namespace "http://www.w3.org/2000/01/rdf-schema#"^^xsd:anyURI ] ,
+    [ sh:prefix "xsd"  ; sh:namespace "http://www.w3.org/2001/XMLSchema#"^^xsd:anyURI ] .
+
+#############################  hsh:DiagramShape
+
+# NOT closed. A host hangs its own predicates on a diagram, and typo-catching on
+# an open class is the host's business: it declares its own closed shape locally.
+hsh:DiagramShape a sh:NodeShape ;
+  sh:targetClass hive:Diagram ;
+
+  sh:property [
+    sh:path hive:slug ; sh:datatype xsd:string ;
+    sh:minCount 1 ; sh:maxCount 1 ;
+    sh:pattern "^[a-z0-9]+(-[a-z0-9]+)*$" ;
+    sh:message """rule: A hive:Diagram carries exactly one hive:slug, kebab-case.
+why:  The slug is the last segment of the diagram IRI and the name a writer
+      addresses the diagram by when it re-exports. Missing, doubled, capitalised
+      or spaced, it stops matching, and the next export writes a second diagram
+      beside this one instead of replacing it.
+fix:  Give the diagram one hive:slug matching ^[a-z0-9]+(-[a-z0-9]+)*$ and equal
+      to the last segment of its own IRI.""" ;
+  ] ;
+
+  sh:property [
+    sh:path rdfs:label ; sh:minCount 1 ; sh:maxCount 1 ; sh:minLength 1 ;
+    sh:message """rule: A hive:Diagram carries exactly one non-empty rdfs:label.
+why:  The label is the only human name the diagram has. A reviewer meeting an
+      untitled diagram in a diff has nothing to tell it from the next one, and
+      the editor has nothing to put in its heading.
+fix:  Add one rdfs:label carrying the title a reader should see.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:mode ; sh:minCount 1 ; sh:maxCount 1 ;
+    sh:in ( hive:pinned hive:standalone ) ;
+    sh:message """rule: A hive:Diagram carries exactly one hive:mode, hive:pinned or hive:standalone.
+why:  The mode decides which properties a placement may carry, so it is stated
+      rather than inferred: a diagram that had lost its last placement would
+      otherwise change mode in silence, and an editor loading it could not know
+      whether typing a label is allowed. A misspelled mode IRI is not a third
+      mode, it is a file no reader can classify.
+fix:  Set hive:mode to hive:pinned or hive:standalone. This is checked with sh:in
+      rather than a pattern precisely so a near-miss spelling is caught too.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:lattice ; sh:minCount 1 ; sh:maxCount 1 ;
+    sh:in ( hive:oddRPointyTop ) ;
+    sh:message """rule: A hive:Diagram carries exactly one hive:lattice, and hive:oddRPointyTop is the only convention defined today.
+why:  Two tools disagreeing about the convention produce the same integers and a
+      different picture, with nothing anywhere to say so. A reader that meets a
+      convention it does not implement must refuse rather than approximate, which
+      it can only do if the file names one.
+fix:  Set hive:lattice to hive:oddRPointyTop, or define the second convention in
+      the vocabulary before writing a document in it.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:formatVersion ; sh:maxCount 1 ; sh:datatype xsd:string ;
+    sh:pattern "^[0-9]+\\.[0-9]+\\.[0-9]+$" ;
+    sh:message """rule: A hive:Diagram carries at most one hive:formatVersion, MAJOR.MINOR.PATCH.
+why:  This is the only marker in a saved file that says which vocabulary
+      release its terms were written against. hive:generator is free text, is
+      never required to name a version at all, and is overwritten by every
+      writer that re-saves the file - none of which a reader can safely parse
+      or trust. Without a stated version, an older reader has no way to know
+      it is looking at a file that may use a term it has never heard of, and
+      the loss is silent: it simply drops whatever it does not recognise.
+fix:  State the MAJOR.MINOR.PATCH of the vocabulary release the writer
+      targeted, for example \"0.3.0\". Optional today; a future major version
+      of this vocabulary may require it.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:pinnedTo ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:message """rule: A hive:Diagram carries at most one hive:pinnedTo, and it is an IRI.
+why:  Two sources is a layout of neither. A literal here names a source nothing
+      can resolve, and this vocabulary deliberately never dereferences the value,
+      so nothing downstream would notice.
+fix:  Name the single external source this layout lays out as one IRI. Whether
+      that IRI resolves is a question only the consuming repository can answer,
+      and it answers it in a shape of its own.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:pinnedRevision ; sh:maxCount 1 ; sh:datatype xsd:string ;
+    sh:message """rule: A hive:Diagram carries at most one hive:pinnedRevision, a string.
+why:  It is the drift detector: compared against the source current revision it
+      is what lets a reader be told that this layout predates the data, instead
+      of being shown a diagram that is quietly one cell short. Two revisions
+      detect nothing.
+fix:  Record one revision of the pinned source. The spelling - digest, git sha,
+      version string - belongs to the host, which pins it in its own shape.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:placement ; sh:minCount 1 ; sh:nodeKind sh:IRI ;
+    sh:message """rule: A hive:Diagram carries at least one hive:placement, and every value is an IRI.
+why:  A diagram with no placement draws nothing: that is a saved file which lost
+      its contents, not an empty canvas worth keeping. A placement written as a
+      blank node is invisible to any gate that selects subjects by IRI prefix, so
+      it would be the single unchecked thing in an otherwise checked file.
+fix:  Give the diagram its placements as IRIs under the document own subject
+      namespace.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:group ; sh:nodeKind sh:IRI ;
+    sh:message """rule: Every hive:group value of a hive:Diagram is an IRI.
+why:  A group is named by placements and by the diagram that declares it; a blank
+      node cannot be named from a second place, so a blank-node group can never be
+      the one a placement points at.
+fix:  Declare each group as an IRI subject. Groups are optional - a diagram with
+      none is fine.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:note ; sh:maxCount 1 ; sh:datatype xsd:string ;
+    sh:message """rule: A hive:Diagram carries at most one hive:note, a string.
+why:  The note is one line printed under the heading. Two of them is two lines
+      with no order between them, and the renderer would have to invent one.
+fix:  Merge the notes into one, or move the detail to rdfs:comment, which says
+      what the diagram IS rather than what a reader should know while looking.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:generator ; sh:maxCount 1 ; sh:datatype xsd:string ;
+    sh:message """rule: A hive:Diagram carries at most one hive:generator, a string naming the writer and its version.
+why:  An exported diagram arrives through a clipboard or a download rather than
+      through a script anybody can re-run, so the file itself is the only place
+      its provenance can live. Two generators is two claims about who wrote one
+      file.
+fix:  Record the writing tool once, as name and version.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:generatedAt ; sh:maxCount 1 ; sh:datatype xsd:dateTime ;
+    sh:pattern "(Z|[+-][0-9]{2}:[0-9]{2})$" ;
+    sh:message """rule: A hive:Diagram carries at most one hive:generatedAt, an xsd:dateTime with an explicit time zone.
+why:  Read against the pinned source own last change, this timestamp says whether
+      the layout was placed before or after the thing it lays out last moved. A
+      dateTime with no zone compares wrongly the moment a CI runner sits in a
+      different one, and xsd:dateTime alone does not require the zone - the
+      pattern does.
+fix:  Write the timestamp with a zone, for example 2026-01-31T09:12:44Z.""" ;
+  ] .
+
+#############################  hsh:PlacementShape - THE ONE CLOSED SHAPE
+
+#################################################################
+# THE CLOSED SHAPE IS OPT-IN UNLESS SOMETHING DEMANDS THE TYPE, and that is a
+# hole in the vocabulary's central promise rather than a nicety.
+#
+# hsh:PlacementShape targets `a hive:Placement`. A writer who simply OMITS that
+# type escapes it entirely — and with it sh:closed, the one mechanism that makes
+# "a pinned layout cannot cache a label" true. Reproduced with pyshacl: a pinned
+# diagram whose placement carried hive:col, hive:row, hive:represents AND an
+# rdfs:label, with no rdf:type, validated clean.
+#
+# So the type is required of anything that behaves like a placement. Targeting
+# hive:col rather than hive:inGroup or hive:represents because col is the one
+# property every placement has in both modes and nothing else in the vocabulary
+# uses: a subject carrying a lattice column IS a placement, whatever it calls
+# itself.
+#################################################################
+
+hsh:PlacementsAreTyped a sh:NodeShape ;
+  sh:targetSubjectsOf hive:col ;
+  sh:message """rule: anything carrying hive:col must be declared `a hive:Placement`.
+why:  the closed-shape guarantee — that a placement cannot carry content — is
+      enforced by a shape that targets the CLASS. An untyped subject with a
+      column and a row is a placement in every way that matters to a renderer and
+      in none that matter to the validator, so it may carry a cached label the
+      vocabulary promises is impossible.
+fix:  add `a hive:Placement` to the subject.""" ;
+  sh:class hive:Placement .
+
+hsh:PlacementShape a sh:NodeShape ;
+  sh:targetClass hive:Placement ;
+  sh:closed true ;
+  sh:ignoredProperties ( rdf:type ) ;
+  sh:message """rule: A hive:Placement carries nothing beyond hive:col, hive:row, hive:inGroup and one of hive:represents or hive:tile.
+why:  THIS IS THE ANTI-DRIFT RULE. A label, a comment, a symbol or a layer copied
+      onto a placement is content cached beside a layout, and nothing anywhere
+      invalidates it: the source changes, the copy does not, and the diagram
+      quietly shows last year. This is the one closed shape in the contract, so
+      caching is not a rule a contributor has to remember - it is a file that will
+      not validate.
+fix:  Delete the extra predicate. In hive:pinned mode the content belongs to the
+      subject named by hive:represents; in hive:standalone mode it belongs on the
+      hive:Tile named by hive:tile, which is left open for exactly this.""" ;
+
+  sh:property [
+    sh:path hive:col ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ;
+    sh:message """rule: A hive:Placement carries exactly one hive:col, an xsd:integer which may be negative.
+why:  With hive:row it IS the cell. A placement missing a coordinate is a tile
+      with no position, which a renderer can only drop or pile at the origin. The
+      origin is wherever the first tile landed rather than a corner, so negative
+      columns are ordinary and an implementation that indexes a grid from zero
+      loses them without saying so.
+fix:  Give the placement one hive:col as a plain integer, negative if that is
+      where the cell is.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:row ; sh:datatype xsd:integer ; sh:minCount 1 ; sh:maxCount 1 ;
+    sh:message """rule: A hive:Placement carries exactly one hive:row, an xsd:integer which may be negative.
+why:  With hive:col it IS the cell, and under hive:oddRPointyTop the row parity
+      decides which way the row is shifted, so a missing or duplicated row is not
+      a missing number but a cell in the wrong place. Whether two placements share
+      a cell is checked separately, by hsh:NoTwoInOneCell.
+fix:  Give the placement one hive:row as a plain integer.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:inGroup ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:message """rule: A hive:Placement names at most one hive:inGroup, and it is an IRI.
+why:  Membership is a fact about the diagram, not about an editor's gestures. An
+      editor that offers to move a whole group translates every placement sharing
+      this value rigidly; one that offers to move a single placement leaves the
+      rest where they are and reports the group as being in more than one piece.
+      Either way the value survives the move. Two groups would make one placement
+      follow two regions and arrive at neither.
+fix:  Name one group, or none. That the group is one this diagram declares is
+      checked by hsh:GroupBelongsToItsDiagram.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:represents ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:message """rule: A hive:Placement names at most one hive:represents, and it is an IRI.
+why:  Two external subjects in one cell is two drawings for one hexagon with no
+      precedence between them, so which wins depends on statement order. A literal
+      here is content cached on a placement under a different name, which is
+      exactly the drift the closed shape exists to stop.
+fix:  Name one external subject as an IRI in the host own namespace. Whether that
+      subject still exists is a question only the consuming repository can answer,
+      and it answers it in a shape of its own.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:tile ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    # sh:class, not merely sh:nodeKind: "standalone means self-contained" is the
+    # whole trade that mode makes, and without this a placement may name a tile
+    # that is not in the document at all. Reproduced: hive:tile pointing at
+    # <https://elsewhere.example.net/tiles#ghost>, with no hive:Tile anywhere,
+    # validated clean. sh:class requires the object to BE a hive:Tile in the
+    # graph being validated, which is exactly the containment claim.
+    sh:class hive:Tile ;
+    sh:message """rule: A hive:Placement names at most one hive:tile, and it is an IRI.
+why:  Two tiles in one cell is two contents for one hexagon with no precedence.
+      A blank-node tile cannot be named by anything else in the document, so
+      nothing could ever point a second placement at the same content.
+fix:  Name one hive:Tile declared in this same document.""" ;
+  ] .
+
+#############################  hsh:PlacementDrawsOneThing
+
+# Its own node shape because sh:xone is node-level and hsh:PlacementShape has
+# already spent its one node-level constraint on sh:closed (convention 1 above).
+hsh:PlacementDrawsOneThing a sh:NodeShape ;
+  sh:targetClass hive:Placement ;
+  sh:message """rule: A hive:Placement carries hive:represents OR hive:tile, never both and never neither.
+why:  A cell that draws nothing is an empty hexagon which still reserves a lattice
+      position, so the next drop onto it is refused for a reason nothing on screen
+      explains. A cell that draws twice is two contents with no precedence, and
+      which one wins depends on statement order - so the same file draws
+      differently after an unrelated re-export.
+fix:  In a hive:pinned diagram give the placement one hive:represents; in a
+      hive:standalone diagram give it one hive:tile.""" ;
+  sh:xone (
+    [
+      sh:property [
+        sh:path hive:represents ; sh:minCount 1 ;
+        sh:message """rule: The pinned branch of hsh:PlacementDrawsOneThing requires hive:represents.
+why:  UNREACHABLE, AND WRITTEN ANYWAY - see convention 2 at the head of this file.
+      A single result is reported at the enclosing sh:xone and this message is
+      never evaluated; a consumer gate nevertheless requires an sh:message on
+      every node stating a constraint, and sh:minCount is one.
+fix:  Read the hsh:PlacementDrawsOneThing message instead - it is the one a
+      contributor is shown.""" ;
+      ] ;
+      sh:property [
+        sh:path hive:tile ; sh:maxCount 0 ;
+        sh:message """rule: The pinned branch of hsh:PlacementDrawsOneThing forbids hive:tile.
+why:  UNREACHABLE, AND WRITTEN ANYWAY - see convention 2 at the head of this file.
+      A single result is reported at the enclosing sh:xone and this message is
+      never evaluated; a consumer gate nevertheless requires an sh:message on
+      every node stating a constraint, and sh:maxCount is one.
+fix:  Read the hsh:PlacementDrawsOneThing message instead - it is the one a
+      contributor is shown.""" ;
+      ] ;
+    ]
+    [
+      sh:property [
+        sh:path hive:tile ; sh:minCount 1 ;
+        sh:message """rule: The standalone branch of hsh:PlacementDrawsOneThing requires hive:tile.
+why:  UNREACHABLE, AND WRITTEN ANYWAY - see convention 2 at the head of this file.
+      A single result is reported at the enclosing sh:xone and this message is
+      never evaluated; a consumer gate nevertheless requires an sh:message on
+      every node stating a constraint, and sh:minCount is one.
+fix:  Read the hsh:PlacementDrawsOneThing message instead - it is the one a
+      contributor is shown.""" ;
+      ] ;
+      sh:property [
+        sh:path hive:represents ; sh:maxCount 0 ;
+        sh:message """rule: The standalone branch of hsh:PlacementDrawsOneThing forbids hive:represents.
+why:  UNREACHABLE, AND WRITTEN ANYWAY - see convention 2 at the head of this file.
+      A single result is reported at the enclosing sh:xone and this message is
+      never evaluated; a consumer gate nevertheless requires an sh:message on
+      every node stating a constraint, and sh:maxCount is one.
+fix:  Read the hsh:PlacementDrawsOneThing message instead - it is the one a
+      contributor is shown.""" ;
+      ] ;
+    ]
+  ) .
+
+#############################  hsh:TileShape
+
+# NOT closed, and that is the point: a host owns tile content, adds its own
+# predicates here, and an editor round-tripping a standalone diagram must carry
+# back predicates it does not understand.
+hsh:TileShape a sh:NodeShape ;
+  sh:targetClass hive:Tile ;
+
+  sh:property [
+    sh:path hive:slug ; sh:datatype xsd:string ;
+    sh:minCount 1 ; sh:maxCount 1 ;
+    sh:pattern "^[a-z0-9]+(-[a-z0-9]+)*$" ;
+    sh:message """rule: A hive:Tile carries exactly one hive:slug, kebab-case.
+why:  The slug is the last segment of the tile own IRI and the name a writer
+      addresses it by on re-export. When it stops matching, the re-export writes a
+      second tile beside the first and the placement points at whichever the
+      reader happens to choose.
+fix:  Give the tile one hive:slug matching ^[a-z0-9]+(-[a-z0-9]+)*$ and equal to
+      the last segment of its own IRI.""" ;
+  ] ;
+
+  sh:property [
+    sh:path rdfs:label ; sh:minCount 1 ; sh:maxCount 1 ; sh:minLength 1 ;
+    sh:message """rule: A hive:Tile carries exactly one non-empty rdfs:label.
+why:  In a standalone diagram the tile is the only place the hexagon text can come
+      from - nothing outside the document is read. A tile with no label draws an
+      empty hexagon which still occupies its cell, so the next drop onto it is
+      refused for a reason nothing on screen explains.
+fix:  Add one rdfs:label with the text the hexagon should show.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:styleKey ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:message """rule: A hive:Tile carries at most one hive:styleKey, and it is an IRI.
+why:  Two style keys is two appearances with no precedence between them. The key
+      is opaque to this vocabulary - it is the seam that keeps a colour scheme out
+      of a diagram format - so nothing here could ever arbitrate. An IRI rather
+      than a string so keys cannot collide across hosts and so a host shape can
+      check the key still resolves to a term that exists.
+fix:  Name one style key as an IRI, or none and let the host draw its default.""" ;
+  ] .
+
+#############################  hsh:GroupShape
+
+hsh:GroupShape a sh:NodeShape ;
+  sh:targetClass hive:Group ;
+
+  sh:property [
+    sh:path hive:slug ; sh:datatype xsd:string ;
+    sh:minCount 1 ; sh:maxCount 1 ;
+    sh:pattern "^[a-z0-9]+(-[a-z0-9]+)*$" ;
+    sh:message """rule: A hive:Group carries exactly one hive:slug, kebab-case.
+why:  The slug is the last segment of the group own IRI and the name a writer
+      addresses it by on re-export. When the two disagree, the re-export writes a
+      second group beside the first and half the placements point at each.
+fix:  Give the group one hive:slug matching ^[a-z0-9]+(-[a-z0-9]+)*$ and equal to
+      the last segment of its own IRI.""" ;
+  ] ;
+
+  sh:property [
+    sh:path rdfs:label ; sh:maxCount 1 ; sh:minLength 1 ;
+    sh:message """rule: A hive:Group carries at most one rdfs:label, and if it carries one it is not empty.
+why:  A group is drawn as a region behind its members, and a label is usually the
+      thing saying why those cells are together - without one the reader gets a
+      coloured blob that asserts a relationship and never names it. USUALLY, not
+      always: where the ground itself is the whole signal, a heading says the same
+      thing twice, and a diagram whose clusters are obvious should be allowed to
+      stay quiet. So a group may have no label at all. What it may not have is an
+      EMPTY one: rdfs:label "" claims the name is the empty string rather than
+      that there is none, and a reader cannot tell the difference.
+fix:  Give it one rdfs:label naming what the members have in common, or omit the
+      predicate entirely. Do not write an empty string.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:styleKey ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:message """rule: A hive:Group carries at most one hive:styleKey, and it is an IRI.
+why:  Two style keys is two appearances for one region with no precedence. The
+      region ground is often the only mark separating one kind of group from
+      another, so the wrong one asserts a claim about the diagram rather than just
+      looking wrong.
+fix:  Name one style key as an IRI, or none and let the host draw its default.""" ;
+  ] ;
+
+  sh:property [
+    sh:path hive:note ; sh:maxCount 1 ; sh:datatype xsd:string ;
+    sh:message """rule: A hive:Group carries at most one hive:note, a string.
+why:  The note is one line printed under the group heading - a multiplier on a
+      replicated stack, a caveat. Two of them is two lines with no order between
+      them, and the renderer would have to invent one.
+fix:  Merge the notes into one, or move the detail to rdfs:comment, which says
+      what the group IS rather than what a reader should know while looking.""" ;
+  ] .
+
+#############################################################
+# The rules that earn the vocabulary. Each sh:SPARQLConstraint carries its own
+# sh:message and the owning node shape carries none, so that message survives.
+#############################################################
+
+hsh:NoTwoInOneCell a sh:NodeShape ;
+  sh:targetClass hive:Diagram ;
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: Two placements of one diagram may not share a cell.
+why:  An overlap is invisible in Turtle and unmistakable on screen: one hexagon
+      simply covers another, and which one wins depends on statement order, so the
+      same file draws differently after an unrelated re-export. The editor makes
+      this unrepresentable at rest - the cell is the key of the map it stores
+      placements in - so a file reaching here with one was hand-edited or written
+      by something else.
+fix:  Move one of the two placements to a free cell, or delete the duplicate.
+      sh:value names the earlier of the pair.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        $this hive:placement ?value , ?other .
+        ?value hive:col ?c ; hive:row ?r .
+        ?other hive:col ?c ; hive:row ?r .
+        FILTER ( STR(?value) < STR(?other) )
+      }
+    """ ;
+  ] .
+
+hsh:ModeIsHonest a sh:NodeShape ;
+  sh:targetClass hive:Diagram ;
+
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: A hive:pinned diagram has no placement carrying hive:tile.
+why:  A pinned layout draws every cell from the source it is pinned to. A
+      placement naming a local hive:Tile is a cell frozen at whatever that tile
+      says while every cell beside it still tracks the source - a diagram half
+      tracking its data and half showing last year, with nothing on the page
+      distinguishing the halves.
+fix:  Delete the hive:tile and give the placement a hive:represents, or set the
+      diagram hive:mode to hive:standalone and convert every placement.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        $this hive:mode hive:pinned ; hive:placement ?value .
+        ?value hive:tile ?t .
+      }
+    """ ;
+  ] ;
+
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: A hive:standalone diagram carries no hive:pinnedTo, and none of its placements carries hive:represents.
+why:  Standalone means nothing outside the document is read, which is the whole
+      trade it makes: nothing regenerates it and nothing can make it stale. A
+      hive:pinnedTo or a hive:represents claims otherwise, and the document then
+      looks regenerable to a reader while no regeneration will ever touch it.
+fix:  Delete the offending value, or set hive:mode to hive:pinned and give every
+      placement a hive:represents. sh:value names what pointed outside.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        $this hive:mode hive:standalone .
+        { $this hive:pinnedTo ?value }
+        UNION
+        { $this hive:placement ?value . ?value hive:represents ?subject }
+      }
+    """ ;
+  ] ;
+
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: A hive:pinned diagram names the source it is pinned to, with hive:pinnedTo.
+why:  A layout of an unnamed source is a layout of nothing in particular. Loaded
+      against the wrong source it silently drops every placement whose subject is
+      absent there and still looks like a diagram, one cell short and saying
+      nothing about which cell it dropped.
+fix:  Add one hive:pinnedTo naming the external source as an IRI.""" ;
+    sh:select """
+      SELECT DISTINCT $this WHERE {
+        $this hive:mode hive:pinned .
+        FILTER NOT EXISTS { $this hive:pinnedTo ?source }
+      }
+    """ ;
+  ] .
+
+hsh:GroupBelongsToItsDiagram a sh:NodeShape ;
+  sh:targetClass hive:Diagram ;
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: Every group a placement names is declared by the same diagram with hive:group.
+why:  A group borrowed from another document makes a group move here reach cells
+      there, because membership is what a group move acts on. A group declared in neither
+      document has no label, no style key and no members any reader can
+      enumerate - it draws as a region with nothing to say about itself.
+fix:  Add hive:group to this diagram naming the group, or point the placement at a
+      group this diagram already declares. sh:value names the group.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        $this hive:placement ?placement .
+        ?placement hive:inGroup ?value .
+        FILTER NOT EXISTS { $this hive:group ?value }
+      }
+    """ ;
+  ] .
+
+hsh:PlacementBelongsToOneDiagram a sh:NodeShape ;
+  sh:targetClass hive:Placement ;
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: A hive:Placement belongs to exactly one hive:Diagram.
+why:  A placement named by two diagrams is one cell in two drawings: dragging it
+      in one moves it in the other, and from that moment the two disagree about
+      their own contents. hsh:GroupBelongsToItsDiagram cannot see this - it looks
+      outwards from one diagram and each diagram alone is consistent.
+fix:  Give each diagram its own placement subjects; they are cheap and carry
+      nothing worth sharing. sh:value names the second diagram.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        ?first hive:placement $this .
+        ?value hive:placement $this .
+        FILTER ( STR(?first) < STR(?value) )
+      }
+    """ ;
+  ] .
+
+hsh:SlugMatchesIri a sh:NodeShape ;
+  sh:targetSubjectsOf hive:slug ;
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: A hive:slug equals the last segment of its own subject IRI.
+why:  A writer addresses subjects by slug when it re-exports. When the two
+      disagree the re-export writes a second subject beside the first rather than
+      replacing it, and the document quietly gains a duplicate that every later
+      read has to choose between.
+fix:  Rename the slug to the last segment of the IRI, or move the subject to the
+      IRI its slug implies. sh:value names the slug that disagrees.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        $this hive:slug ?value .
+        FILTER ( REPLACE( STR($this), "^.*[/#]", "" ) != STR(?value) )
+      }
+    """ ;
+  ] .
+
+# WARNING, NOT VIOLATION, and the severity is on the SHAPE because inside an
+# sh:SPARQLConstraint it is silently ignored and the rule reports as a Violation.
+# A real published diagram already contains one such pair - measured, not assumed -
+# so a rule that rejected it would reject the very drawing this vocabulary was
+# written to carry.
+hsh:GroupsDoNotTouch a sh:NodeShape ;
+  sh:targetClass hive:Diagram ;
+  sh:severity sh:Warning ;
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: Cells of two different groups are edge-adjacent, so the two regions will merge when drawn.
+why:  A group region is drawn by growing every member hexagon until adjacent ones
+      overlap, which is what makes the region follow its members for free. Two
+      groups whose cells touch therefore produce one continuous blob across two
+      grounds, and the ground is often the only mark separating one kind of group
+      from another. This is a warning on purpose: the arrangement is legal, and
+      refusing it would refuse diagrams that already exist.
+fix:  Move one group a cell away if the merge would mislead, or leave it and know
+      the two regions will read as one. sh:value names the first group of the
+      pair.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        $this hive:placement ?pa , ?pb .
+        ?pa hive:inGroup ?ga ; hive:col ?ca ; hive:row ?ra .
+        ?pb hive:inGroup ?gb ; hive:col ?cb ; hive:row ?rb .
+        FILTER ( STR(?ga) < STR(?gb) )
+        BIND ( ?ra - ( 2 * FLOOR( ?ra / 2 ) ) AS ?s )
+        FILTER ( ( ?rb = ?ra && ABS(?cb - ?ca) = 1 ) ||
+                 ( ABS(?rb - ?ra) = 1 && ( ?cb = ?ca - 1 + ?s || ?cb = ?ca + ?s ) ) )
+        BIND ( ?ga AS ?value )
+      }
+    """ ;
+  ] .
+
+hsh:LinkShape a sh:NodeShape ;
+  sh:targetClass hive:Link ;
+  rdfs:label "Link"@en ;
+  # NOT CLOSED, for hive:Tile's reason: a host annotates its own lines - a
+  # protocol, a cardinality, a colour of its own - and an editor that round-trips
+  # a document must give back the predicates it did not understand.
+  sh:property [
+    sh:path hive:from ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:class hive:Placement ;
+    sh:message """rule: A hive:Link names exactly one hive:from, and it is a hive:Placement.
+why:  A link with no start, or one whose start is not a placement, is a line the
+      renderer has no cell to draw from. It draws nothing, which looks exactly
+      like a link that was never there - so the file asserts a connection and the
+      picture silently omits it.
+fix:  Point hive:from at a hive:Placement this diagram declares with hive:placement.""" ;
+  ] ;
+  sh:property [
+    sh:path hive:to ; sh:minCount 1 ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:class hive:Placement ;
+    sh:message """rule: A hive:Link names exactly one hive:to, and it is a hive:Placement.
+why:  As hive:from. A link is directed: undirected is a special case of directed
+      and not the reverse, so both ends are required and which is which is kept.
+fix:  Point hive:to at a hive:Placement this diagram declares with hive:placement.""" ;
+  ] ;
+  sh:property [
+    sh:path hive:routing ; sh:maxCount 1 ; sh:nodeKind sh:IRI ;
+    sh:in ( hive:straight hive:latticePath hive:arc ) ;
+    sh:message """rule: A hive:Link carries at most one hive:routing, from the closed set of three.
+why:  Routing is geometry rather than appearance: where a line goes is a question
+      about the lattice, and two hosts drawing the same document must put it in
+      the same place or they are drawing different diagrams. A fourth value would
+      be a fourth renderer, and a reader meeting one cannot approximate it -
+      there is no 'roughly straight'.
+fix:  Use hive:straight, hive:latticePath or hive:arc, or omit it - absent means
+      hive:straight.""" ;
+  ] ;
+  sh:property [
+    sh:path rdfs:label ; sh:maxCount 1 ; sh:minLength 1 ;
+    sh:message """rule: A hive:Link carries at most one rdfs:label, and if it carries one it is not empty.
+why:  Most lines say enough by existing. One that needs words - 'registers offers',
+      'once per participant' - gets one, and an empty string claims the label IS
+      empty rather than that there is none.
+fix:  Give it a label or omit the predicate.""" ;
+  ] .
+
+hsh:LinkEndsBelongToItsDiagram a sh:NodeShape ;
+  sh:targetClass hive:Diagram ;
+  rdfs:label "A link joins two placements of the same diagram"@en ;
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: Both ends of every hive:link are placements this same diagram declares.
+why:  hsh:LinkShape checks that an end IS a placement; it cannot check WHOSE. A
+      link reaching into another diagram's placement draws a line from a cell
+      this drawing does not contain, and a corpus holding two diagrams in one
+      file is the ordinary case rather than an exotic one.
+fix:  Point both ends at placements this diagram names with hive:placement.
+      sh:value names the offending end.""" ;
+    sh:select """
+      SELECT DISTINCT $this ?value WHERE {
+        $this hive:link ?link .
+        ?link hive:from|hive:to ?value .
+        FILTER NOT EXISTS { $this hive:placement ?value }
+      }
+    """ ;
+  ] .
+
+hsh:NoLinkToItself a sh:NodeShape ;
+  sh:targetClass hive:Link ;
+  rdfs:label "A link joins two different placements"@en ;
+  sh:sparql [
+    a sh:SPARQLConstraint ;
+    sh:prefixes <https://semantic.ds-labs.org/shapes/honeycomb> ;
+    sh:message """rule: hive:from and hive:to name different placements.
+why:  A link from a cell to itself has no direction, no length and nothing to
+      draw. It is not a diagram that says something unusual, it is a statement
+      with no picture.
+fix:  Point the two ends at different placements, or drop the link.""" ;
+    sh:select """
+      SELECT DISTINCT $this WHERE {
+        $this hive:from ?a ; hive:to ?a .
+      }
+    """ ;
+  ] .
