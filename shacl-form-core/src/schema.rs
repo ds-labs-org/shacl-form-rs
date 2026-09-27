@@ -46,11 +46,7 @@ pub fn from_shape_iri(graph: &Graph, shape_iri: &NamedNode) -> Result<FormSchema
     if !graph.contains(TripleRef::new(subject.as_ref(), rdf::TYPE, sh::NODE_SHAPE)) {
         return Err(ShapesError::NotANodeShape(shape_iri.as_str().to_string()));
     }
-    let target_class = match graph.object_for_subject_predicate(subject.as_ref(), sh::TARGET_CLASS)
-    {
-        Some(TermRef::NamedNode(c)) => Some(c.into_owned()),
-        _ => None,
-    };
+    let target_class = shape_own_target_class(graph, &subject);
     let mut cache = ShapeCache::new();
     let rc = walk_shapes(graph, vec![subject], target_class, 0, &mut cache);
     Ok((*rc).clone())
@@ -77,10 +73,19 @@ pub fn from_target_class(graph: &Graph, class_iri: &NamedNode) -> Result<FormSch
     Ok((*rc).clone())
 }
 
+/// Every subject asserting `sh:targetClass <class>` — deliberately NOT
+/// filtered to ones also carrying an explicit `a sh:NodeShape` triple.
+/// SHACL recognises a node shape structurally (stating `sh:targetClass`,
+/// `sh:property`, or any other shape-defining predicate already makes a
+/// subject a shape); requiring the type triple on top of that made a
+/// perfectly real, spec-legal shape invisible to `sh:class` resolution
+/// just because its author omitted an optional assertion. `from_shape_iri`
+/// keeps its own explicit check — a caller naming a shape directly by IRI
+/// is a different, narrower question ("is *this* the shape I mean")
+/// than "which shapes, however stated, target this class".
 fn find_node_shapes_for_class(graph: &Graph, class: NamedNodeRef<'_>) -> Vec<Subject> {
     let mut shapes: Vec<Subject> = graph
         .subjects_for_predicate_object(sh::TARGET_CLASS, class)
-        .filter(|s| graph.contains(TripleRef::new(*s, rdf::TYPE, sh::NODE_SHAPE)))
         .map(SubjectRef::into_owned)
         .collect();
     // `oxrdf::Graph` iterates in whatever order its internal set happens to
@@ -94,6 +99,18 @@ fn find_node_shapes_for_class(graph: &Graph, class: NamedNodeRef<'_>) -> Vec<Sub
 
 fn shape_key_owned(subject: &Subject) -> String {
     shape_key(subject.as_ref())
+}
+
+/// Reads `sh:targetClass` directly off `shape`, when it states one — the
+/// same lookup `from_shape_iri` does for the root shape, reused by
+/// `resolve_kind`'s `sh:node` branch so the identical shape gets the same
+/// `target_class` (and so the same `rdf:type` assertion on submit)
+/// whether it's used as the form's own root or reached as a nested value.
+fn shape_own_target_class(graph: &Graph, shape: &Subject) -> Option<NamedNode> {
+    match graph.object_for_subject_predicate(shape.as_ref(), sh::TARGET_CLASS) {
+        Some(TermRef::NamedNode(c)) => Some(c.into_owned()),
+        _ => None,
+    }
 }
 
 /// Node shapes this crate reads a form-level fact from directly — anything
@@ -579,11 +596,10 @@ fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc, combi
                 );
                 collect_constraints(graph, first.as_ref(), acc, combinator_depth + 1);
             }
-            if branches.len() > 1 {
-                acc.unsupported.push(format!(
-                    "{combinator} has {} branches; only the first is reflected in this field — see the shape source for the rest",
-                    branches.len()
-                ));
+            match branches.len() {
+                0 => acc.unsupported.push(format!("{combinator} has no branches (an empty list) — nothing to enforce")),
+                1 => {}
+                n => acc.unsupported.push(format!("{combinator} has {n} branches; only the first is reflected in this field — see the shape source for the rest")),
             }
         }
     }
@@ -643,7 +659,35 @@ fn resolve_kind(
 ) -> FieldKind {
     if let Some(node) = &acc.node {
         return match as_subject_term(node) {
-            Some(subject) => nest_shapes(graph, vec![subject], None, depth, cache, unsupported),
+            Some(subject) => {
+                // sh:node and sh:class stated together on one property is
+                // legal but this crate can only nest via ONE shape
+                // reference — sh:node's, since it names an exact shape
+                // rather than "however many shapes happen to target this
+                // class". sh:class's own class is not silently dropped for
+                // that, though: it still names what the value must be an
+                // instance of, so it's threaded through as the nested
+                // schema's target_class (asserted as rdf:type on submit —
+                // see FormValues::to_turtle) even though sh:node's shape is
+                // what supplies the fields.
+                if acc.class.is_some() {
+                    unsupported.push(
+                        "sh:node and sh:class are both stated on this property; nesting via sh:node's own shape, and still asserting sh:class's class on the value".to_string(),
+                    );
+                }
+                let target_class = acc
+                    .class
+                    .clone()
+                    .or_else(|| shape_own_target_class(graph, &subject));
+                nest_shapes(
+                    graph,
+                    vec![subject],
+                    target_class,
+                    depth,
+                    cache,
+                    unsupported,
+                )
+            }
             None => fallback_iri(
                 unsupported,
                 format!("sh:node <{node}> is not a shape reference"),
@@ -654,7 +698,7 @@ fn resolve_kind(
         let shapes = find_node_shapes_for_class(graph, class.as_ref());
         if shapes.is_empty() {
             unsupported.push(format!(
-                "no sh:NodeShape has sh:targetClass <{}>; rendered as a plain IRI field",
+                "no shape has sh:targetClass <{}>; rendered as a plain IRI field",
                 class.as_str()
             ));
             return FieldKind::Iri;

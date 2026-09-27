@@ -218,3 +218,59 @@ fn re_saving_an_untouched_nested_value_keeps_its_own_subject_rather_than_minting
         "no blank node should have been minted for a value that already had a real subject:\n{turtle}"
     );
 }
+
+/// Fable audit finding 4: an unsaved nested value (`subject: None` — never
+/// read from anywhere, only just created in this session) had no stable
+/// identity of its own, so `to_turtle` minted a fresh *random* blank node
+/// on every call. Calling it twice on the same, unedited `FormValues` (a
+/// user who clicks Submit again after a failed network save, without
+/// reloading — the form's own values never changed) must describe the
+/// *same* logical value both times, not two different blank-node
+/// identities a receiving store would treat as two different resources.
+#[test]
+fn calling_to_turtle_twice_on_the_same_unsaved_nested_value_mints_the_same_blank_node() {
+    let shapes = parse_turtle(SHAPES).unwrap();
+    let schema = from_shape_iri(
+        &shapes,
+        &NamedNode::new("http://example.org/PersonShape").unwrap(),
+    )
+    .unwrap();
+    let friend_idx = schema
+        .fields
+        .iter()
+        .position(|f| f.label == "friend")
+        .unwrap();
+
+    let mut values = FormValues::new_for(&schema);
+    let mut friend_values = FormValues::new_for(match &schema.fields[friend_idx].kind {
+        FieldKind::Nested { schema } => schema,
+        other => panic!("expected Nested, got {other:?}"),
+    });
+    let friend_name_idx = match &schema.fields[friend_idx].kind {
+        FieldKind::Nested { schema } => schema
+            .fields
+            .iter()
+            .position(|f| f.label == "name")
+            .unwrap(),
+        _ => unreachable!(),
+    };
+    friend_values.set(
+        friend_name_idx,
+        vec![ValueEntry::Literal(Literal::new_simple_literal("Bob"))],
+    );
+    values.set(
+        friend_idx,
+        vec![ValueEntry::Nested {
+            subject: None,
+            values: std::rc::Rc::new(friend_values),
+        }],
+    );
+
+    let subject = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/alice").unwrap());
+    let first = values.to_turtle(&schema, &subject, &[]);
+    let second = values.to_turtle(&schema, &subject, &[]);
+    assert_eq!(
+        first, second,
+        "the same unedited FormValues must serialise identically on repeated calls, not mint a fresh random blank node each time"
+    );
+}

@@ -11,8 +11,10 @@
 #                     No UI framework at all, so a host-side generator could
 #                     use it without linking yew.
 #   shacl-form-yew    the component: renders a FormSchema as real form
-#                     controls, collects edits, reports SHACL validation
-#                     errors as the user types.
+#                     controls (native HTML5 pattern/min/max/minlength/
+#                     maxlength attributes, enforced by the browser's own
+#                     default UI on submit) and collects edits. No custom
+#                     per-keystroke SHACL validation-message feedback.
 #   demo              the Trunk app: paste a shapes graph, pick a target
 #                     shape, get a live form and the Turtle it produces.
 #
@@ -26,4 +28,4 @@ members = ["shacl-form-core", "shacl-form-yew", "demo"]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/ds-labs-org/ds-shacl-form-rs"
+repository = "https://github.com/ds-labs-org/shacl-form-rs"

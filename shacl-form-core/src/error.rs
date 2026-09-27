@@ -8,10 +8,6 @@ pub enum ShapesError {
     InstanceTurtle(oxttl::TurtleSyntaxError),
     #[error("<{0}> is not `a sh:NodeShape` in this shapes graph")]
     NotANodeShape(String),
-    #[error("no `sh:NodeShape` in this shapes graph has `sh:targetClass <{0}>`")]
+    #[error("no shape in this shapes graph has `sh:targetClass <{0}>`")]
     NoShapeForClass(String),
-    #[error(
-        "shape <{0}> refers to itself through `sh:node`/`sh:class` with no base case — refusing rather than recursing forever"
-    )]
-    CyclicShape(String),
 }

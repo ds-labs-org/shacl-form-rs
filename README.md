@@ -71,9 +71,11 @@ see `shacl-form-core/tests/honeycomb.rs`), not just hand-written fixtures.
 | `sh:minLength`/`maxLength`/`pattern`/`minInclusive`/`maxInclusive`/`minExclusive`/`maxExclusive` | HTML `minlength`/`maxlength`/`min`/`max`, and `pattern` rebuilt as an unanchored-contains match (SHACL's own semantics — see `controls.rs`'s `combined_pattern`), not HTML's anchored one |
 | `sh:defaultValue` | pre-fills a new instance (never overwrites an edited one) |
 | `sh:order` | sorts fields; absent order sorts last, tie-broken by predicate for determinism (`oxrdf::Graph` iterates in an interned, not insertion, order — see `schema.rs`'s own `order_key`/`tie_break_key` docs) |
-| more than one `sh:NodeShape` sharing a `sh:targetClass` | merged into one form (`from_target_class`), regardless of which shape happens to sort first |
-| `rdf:type` for a `from_target_class` form's own subject, and for a `sh:class`-nested value | asserted on submit (`FormSchema::target_class`) — otherwise the produced instance would not conform to the very constraint that shaped it |
-| re-saving an untouched value nested under `sh:node`/`sh:class` (edit mode) | reuses the subject it was read from (`ValueEntry::Nested`'s own `subject`); does not replace it with a fresh blank node |
+| more than one `sh:NodeShape` sharing a `sh:targetClass` | merged into one form (`from_target_class`), regardless of which shape happens to sort first, and regardless of whether every one of them states an explicit `a sh:NodeShape` (a shape asserting `sh:targetClass` is recognised structurally, per SHACL) |
+| `rdf:type` for a `from_target_class` form's own subject, a `sh:class`-nested value, and a `sh:node`-nested value whose *referenced* shape states its own `sh:targetClass` | asserted on submit (`FormSchema::target_class`) — otherwise the produced instance would not conform to the very constraint that shaped it |
+| `sh:node` and `sh:class` both stated on one property | nests via `sh:node`'s own shape (an exact reference beats "however many shapes target this class"), but still asserts `sh:class`'s class as `rdf:type` — noted, not silently dropped |
+| re-saving an untouched value nested under `sh:node`/`sh:class` (edit mode) | reuses the subject it was read from (`ValueEntry::Nested`'s own `subject`); does not replace it with a fresh blank node, and mints the same stable id on repeated `to_turtle` calls for a value that has none yet (a resubmit after a failed save doesn't invent a second resource for the same unsaved value) |
+| `sh:or ()` / `sh:xone ()` (an empty branch list) | reported as unsupported, not silently ignored |
 
 Nothing here is silently approximated: a construct this crate can't
 faithfully turn into a control is named in `Field::unsupported` /
@@ -101,6 +103,18 @@ in time proportional to the tree's *distinct* schemas, not to how many
   *serialisation* time rather than written as unparseable Turtle.
 - No enforcement of `sh:closed`/`sh:disjoint`/`sh:equals`/`sh:lessThan`/
   `sh:sparql`/`sh:qualifiedValueShape` at all (see the coverage table).
+- Repeated entries of one field are addressed positionally (a repetition
+  *index*, captured when that entry's control was rendered), not by a
+  stable per-entry id. `FormState::reduce` applies dispatched actions to
+  whatever is actually current (see "Design notes" below) — the *lost
+  update* case is fixed — but if a `Remove` and a second action captured
+  from the *same* pre-removal render land in one dispatch batch (no
+  re-render in between), the second action's index can point past where
+  its intended entry now sits. `set_leaf`/`remove_entry` treat an
+  out-of-range index as a no-op rather than fabricating a new entry (the
+  bug an earlier audit pass found and this one fixed), but a no-op still
+  means that second edit doesn't land — a stable-id redesign of repeated
+  entries would close this properly; not done here.
 - No `demo-ssg` (a host-only static pre-render, the way
   `ds-honeycomb-editor-rs` has one) yet.
 - `shacl-form-yew` ships no CSS at all — the host supplies class names

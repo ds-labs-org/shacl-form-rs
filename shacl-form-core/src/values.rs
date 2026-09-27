@@ -155,7 +155,7 @@ impl FormValues {
             let _ =
                 writer.serialize_triple(TripleRef::new(subject, oxrdf::vocab::rdf::TYPE, class));
         }
-        self.write_triples(schema, subject, &mut writer);
+        self.write_triples(schema, subject, &mut writer, "");
         String::from_utf8(
             writer
                 .finish()
@@ -164,15 +164,24 @@ impl FormValues {
         .expect("oxttl only ever writes valid UTF-8")
     }
 
+    /// `tree_path` names *this call's* position in the value tree as a
+    /// short string (`"f{field}r{rep}"` segments, one per nesting level) —
+    /// used only to mint a stable blank node id for an unsaved (`subject:
+    /// None`) `Nested` value, so that serialising the *same* `FormValues*`
+    /// twice (a user re-submitting after a failed save, with no edits in
+    /// between) names the same blank node both times instead of a fresh
+    /// random one per call — an id `BlankNode::default()` cannot give,
+    /// since it exists precisely to be unique every time it's called.
     fn write_triples<W: std::io::Write>(
         &self,
         schema: &FormSchema,
         subject: &NamedOrBlankNode,
         writer: &mut oxttl::turtle::WriterTurtleSerializer<W>,
+        tree_path: &str,
     ) {
-        for (field, entries) in schema.fields.iter().zip(&self.entries) {
+        for (field_idx, (field, entries)) in schema.fields.iter().zip(&self.entries).enumerate() {
             let Some(path) = &field.path else { continue };
-            for entry in entries.iter() {
+            for (rep, entry) in entries.iter().enumerate() {
                 match entry {
                     // An empty lexical form / empty IRI is what an untouched
                     // required-but-not-yet-typed-into control looks like
@@ -211,12 +220,19 @@ impl FormValues {
                         // there is one, rather than always minting a fresh
                         // blank node — the difference between re-saving
                         // `ex:bob` as `ex:bob` and silently replacing every
-                        // reference to `ex:bob` with a copy of it.
+                        // reference to `ex:bob` with a copy of it. Absent
+                        // that, derive a stable id from this value's own
+                        // position in the tree rather than a fresh random
+                        // one, so re-serialising unedited data twice names
+                        // the same blank node both times.
+                        let child_path = format!("{tree_path}f{field_idx}r{rep}");
                         let owned_subject;
                         let subject_ref = match nested_subject {
                             Some(s) => s,
                             None => {
-                                owned_subject = NamedOrBlankNode::BlankNode(BlankNode::default());
+                                owned_subject = NamedOrBlankNode::BlankNode(
+                                    BlankNode::new_unchecked(format!("shaclform{child_path}")),
+                                );
                                 &owned_subject
                             }
                         };
@@ -228,7 +244,12 @@ impl FormValues {
                                 class,
                             ));
                         }
-                        nested_values.write_triples(nested_schema, subject_ref, writer);
+                        nested_values.write_triples(
+                            nested_schema,
+                            subject_ref,
+                            writer,
+                            &child_path,
+                        );
                     }
                 }
             }

@@ -131,7 +131,7 @@ fn sh_class_with_no_matching_shape_falls_back_to_a_plain_iri_field_and_says_so()
             .unsupported
             .as_deref()
             .unwrap()
-            .contains("no sh:NodeShape")
+            .contains("no shape has sh:targetClass")
     );
 }
 

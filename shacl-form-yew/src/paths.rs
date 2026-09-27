@@ -189,6 +189,18 @@ pub fn update_at(
     new_values
 }
 
+/// Edits one repetition of one field — never appends. `repetition` is
+/// captured at render time by whichever control's `onchange` fired, so it
+/// answers for the list as it stood *then*; if a `Remove`/`Clear` from an
+/// earlier action in the same dispatch batch (no re-render in between —
+/// see `FormState::reduce`'s own doc comment on why a batch can contain
+/// more than one action against the same pre-batch render) has since
+/// shifted or shortened that list, `repetition` may no longer name the
+/// entry the user actually meant to edit. Silently falling back to
+/// "append a new entry" — this function's own behaviour until an audit
+/// caught it — is worse than doing nothing: it fabricates a value nobody
+/// asked to add, on top of leaving the entry the user actually edited
+/// untouched. A no-op at least does not invent data.
 pub fn set_leaf(
     schema: &FormSchema,
     values: &FormValues,
@@ -200,10 +212,8 @@ pub fn set_leaf(
         let mut entries = vs.get(loc.field).to_vec();
         if repetition < entries.len() {
             entries[repetition] = entry;
-        } else {
-            entries.push(entry);
+            vs.set(loc.field, entries);
         }
-        vs.set(loc.field, entries);
     })
 }
 

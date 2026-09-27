@@ -4,7 +4,7 @@
 //! only renders [`shacl_form_core::FormSchema`] and turns DOM events back
 //! into [`shacl_form_core::ValueEntry`] values.
 mod controls;
-mod paths;
+pub mod paths;
 mod render;
 
 use paths::{FormAction, FormState, Loc};
