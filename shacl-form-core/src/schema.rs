@@ -7,7 +7,8 @@ use crate::model::{Field, FieldKind, FormSchema, SelectOption};
 use crate::sh;
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{Graph, NamedNode, NamedNodeRef, Subject, SubjectRef, Term, TermRef, TripleRef};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 /// How many `sh:node`/`sh:class` levels this crate will nest before it
 /// stops and falls back to a plain IRI field instead. Not a SHACL concept,
@@ -21,45 +22,59 @@ use std::collections::HashSet;
 /// needing to tell those cases apart.
 const MAX_NESTING_DEPTH: u32 = 6;
 
+/// How many `sh:and`/`sh:or`/`sh:xone` levels [`collect_constraints`] will
+/// recurse through on one property before it stops. Unlike shape nesting,
+/// this has no legitimate reason to go deep in a real shapes graph — it
+/// exists only so a pathological or malicious shape (a property shape whose
+/// own `sh:and` list contains itself, directly or through a longer cycle)
+/// gets an "unsupported" note instead of a stack overflow, which on wasm is
+/// not a catchable panic at all.
+const MAX_COMBINATOR_DEPTH: u32 = 32;
+
+/// Every distinct `(expanded shape set, target class, nesting depth)` this
+/// crate has already turned into a schema, so that reaching the same shape
+/// twice — the same `sh:node`/`sh:class` referenced from two different
+/// properties, or a shape nested inside itself several times over — shares
+/// one `Rc<FormSchema>` instead of re-walking the graph and re-allocating an
+/// identical tree each time. Without this, a shape with `k` occurrences of
+/// a mutually-self-referencing pair expands to a tree with roughly
+/// `k^MAX_NESTING_DEPTH` fields.
+type ShapeCache = HashMap<(Vec<String>, Option<String>, u32), Rc<FormSchema>>;
+
 pub fn from_shape_iri(graph: &Graph, shape_iri: &NamedNode) -> Result<FormSchema, ShapesError> {
     let subject = Subject::NamedNode(shape_iri.clone());
     if !graph.contains(TripleRef::new(subject.as_ref(), rdf::TYPE, sh::NODE_SHAPE)) {
         return Err(ShapesError::NotANodeShape(shape_iri.as_str().to_string()));
     }
-    Ok(walk_node_shape(graph, subject.as_ref(), 0))
+    let target_class = match graph.object_for_subject_predicate(subject.as_ref(), sh::TARGET_CLASS)
+    {
+        Some(TermRef::NamedNode(c)) => Some(c.into_owned()),
+        _ => None,
+    };
+    let mut cache = ShapeCache::new();
+    let rc = walk_shapes(graph, vec![subject], target_class, 0, &mut cache);
+    Ok((*rc).clone())
 }
 
 /// SHACL lets more than one `sh:NodeShape` target the same class — this
 /// repository's own `vendor/ds-honeycomb-editor-rs/shapes.ttl` does exactly
 /// that (`hive:Diagram` is targeted by `hsh:DiagramShape`, which has
 /// `sh:property`, *and* by three SPARQL-only shapes with none) — so this
-/// merges every matching shape's fields into one schema rather than picking
-/// one arbitrarily, the way `sh:and` already merges branches within one
-/// property shape.
+/// merges every matching shape's `sh:property` list, and every shape's own
+/// `sh:node`/`sh:and` node-level references, before grouping by path and
+/// building fields — the same machinery `resolve_kind`'s `sh:class` branch
+/// uses for a *nested* multi-shape reference. Two property shapes across
+/// that merged set sharing one `sh:path` become one field, not two
+/// (`walk_shapes`'s grouping step), the way two `sh:and` branches on one
+/// property shape already merged into one field.
 pub fn from_target_class(graph: &Graph, class_iri: &NamedNode) -> Result<FormSchema, ShapesError> {
     let shapes = find_node_shapes_for_class(graph, class_iri.as_ref());
     if shapes.is_empty() {
         return Err(ShapesError::NoShapeForClass(class_iri.as_str().to_string()));
     }
-    let mut merged = FormSchema::default();
-    for shape in shapes {
-        let one = walk_node_shape(graph, shape.as_ref(), 0);
-        merged.title = merged.title.or(one.title);
-        merged.description = merged.description.or(one.description);
-        merged.closed |= one.closed;
-        merged.unsupported.extend(one.unsupported);
-        merged.fields.extend(one.fields);
-    }
-    merged.fields.sort_by(|a, b| {
-        order_key(a.order)
-            .total_cmp(&order_key(b.order))
-            .then_with(|| tie_break_key(a).cmp(tie_break_key(b)))
-    });
-    Ok(merged)
-}
-
-fn find_node_shape_for_class(graph: &Graph, class: NamedNodeRef<'_>) -> Option<Subject> {
-    find_node_shapes_for_class(graph, class).into_iter().next()
+    let mut cache = ShapeCache::new();
+    let rc = walk_shapes(graph, shapes, Some(class_iri.clone()), 0, &mut cache);
+    Ok((*rc).clone())
 }
 
 fn find_node_shapes_for_class(graph: &Graph, class: NamedNodeRef<'_>) -> Vec<Subject> {
@@ -71,9 +86,8 @@ fn find_node_shapes_for_class(graph: &Graph, class: NamedNodeRef<'_>) -> Vec<Sub
     // `oxrdf::Graph` iterates in whatever order its internal set happens to
     // hold triples, which is not necessarily insertion order and is not
     // guaranteed stable across versions — sorting by the shape's own IRI
-    // (or blank node id) is what makes `from_target_class`'s merged field
-    // order deterministic between runs, not just "whatever HashSet handed
-    // back this time".
+    // (or blank node id) is what makes the merged field order deterministic
+    // between runs, not just "whatever HashSet handed back this time".
     shapes.sort_by_key(shape_key_owned);
     shapes
 }
@@ -93,28 +107,153 @@ const KNOWN_NODE_SHAPE_PREDS: &[NamedNodeRef<'static>] = &[
     sh::IGNORED_PROPERTIES,
     sh::NAME,
     sh::DESCRIPTION,
+    sh::NODE,
+    sh::AND,
+    sh::MESSAGE,
+    sh::SEVERITY,
+    sh::DEACTIVATED,
 ];
 
-fn walk_node_shape(graph: &Graph, shape: SubjectRef<'_>, depth: u32) -> FormSchema {
+/// Expands `seed` (node shapes a form is being built directly for) through
+/// node-shape-level `sh:node` (a single shape reference: "conforms to this
+/// shape too") and `sh:and` (a list of shape references: the common
+/// SHACL "shape inheritance" idiom, `ex:EmployeeShape sh:and (ex:PersonShape
+/// ex:StaffShape)`), so an inherited shape's own `sh:property` list is
+/// collected right alongside the seed's — the same way `from_target_class`
+/// already merges *sibling* shapes that target one class. Has its own
+/// visited set and terminates unconditionally, independent of the
+/// `ShapeCache`/nesting-depth machinery in [`walk_shapes`]: a self- or
+/// mutually-referencing pair of shapes here (`A sh:and (B)`, `B sh:and (A)`)
+/// is a property-list cycle, not a value-nesting one, and would not be
+/// caught by [`MAX_NESTING_DEPTH`] at all.
+fn expand_shape_refs(graph: &Graph, seed: Vec<Subject>) -> Vec<Subject> {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue = seed;
+    let mut result = Vec::new();
+    while let Some(s) = queue.pop() {
+        if !visited.insert(shape_key(s.as_ref())) {
+            continue;
+        }
+        if let Some(n) = graph.object_for_subject_predicate(s.as_ref(), sh::NODE)
+            && let Some(sub) = as_subject_term(&n.into_owned())
+        {
+            queue.push(sub);
+        }
+        if let Some(head) = graph.object_for_subject_predicate(s.as_ref(), sh::AND) {
+            for branch in rdf_list(graph, head) {
+                if let Some(sub) = as_subject_term(&branch) {
+                    queue.push(sub);
+                }
+            }
+        }
+        result.push(s);
+    }
+    result
+}
+
+/// Builds (or returns the cached) [`FormSchema`] for one or more node
+/// shapes taken together — `from_shape_iri`'s single seed shape,
+/// `from_target_class`'s sibling shapes sharing a `sh:targetClass`, or
+/// `resolve_kind`'s nested `sh:node`/`sh:class` reference, all funnelled
+/// through the same path: expand shape-level inheritance
+/// ([`expand_shape_refs`]), skip anything `sh:deactivated`, flatten every
+/// remaining shape's `sh:property` list, group by resolved path, and build
+/// one [`Field`] per group ([`build_field`]) — so two property shapes
+/// sharing a path, whether from the same node shape or two shapes in the
+/// merged set, become one field instead of a silent duplicate.
+fn walk_shapes(
+    graph: &Graph,
+    shapes: Vec<Subject>,
+    target_class: Option<NamedNode>,
+    depth: u32,
+    cache: &mut ShapeCache,
+) -> Rc<FormSchema> {
+    let mut expanded: Vec<Subject> = expand_shape_refs(graph, shapes)
+        .into_iter()
+        .filter(|s| {
+            !graph
+                .object_for_subject_predicate(s.as_ref(), sh::DEACTIVATED)
+                .is_some_and(is_true)
+        })
+        .collect();
+    expanded.sort_by_key(shape_key_owned);
+    expanded.dedup_by_key(|s| shape_key_owned(s));
+
+    let keys: Vec<String> = expanded.iter().map(|s| shape_key(s.as_ref())).collect();
+    let cache_key = (
+        keys,
+        target_class.as_ref().map(|c| c.as_str().to_string()),
+        depth,
+    );
+    if let Some(cached) = cache.get(&cache_key) {
+        return cached.clone();
+    }
+
     let mut schema = FormSchema {
-        title: literal_string(graph.object_for_subject_predicate(shape, sh::NAME)),
-        description: literal_string(graph.object_for_subject_predicate(shape, sh::DESCRIPTION)),
-        closed: graph
-            .object_for_subject_predicate(shape, sh::CLOSED)
-            .is_some_and(is_true),
+        target_class: target_class.clone(),
         ..Default::default()
     };
-    record_unknown_predicates(
-        graph,
-        shape,
-        KNOWN_NODE_SHAPE_PREDS,
-        &mut schema.unsupported,
-    );
+    for s in &expanded {
+        if schema.title.is_none() {
+            schema.title = literal_string(graph.object_for_subject_predicate(s.as_ref(), sh::NAME));
+        }
+        if schema.description.is_none() {
+            schema.description =
+                literal_string(graph.object_for_subject_predicate(s.as_ref(), sh::DESCRIPTION));
+        }
+        if graph
+            .object_for_subject_predicate(s.as_ref(), sh::CLOSED)
+            .is_some_and(is_true)
+        {
+            schema.closed = true;
+        }
+        record_unknown_predicates(
+            graph,
+            s.as_ref(),
+            KNOWN_NODE_SHAPE_PREDS,
+            &mut schema.unsupported,
+        );
+    }
 
-    let mut fields: Vec<Field> = graph
-        .objects_for_subject_predicate(shape, sh::PROPERTY)
-        .filter_map(|prop| as_subject(prop))
-        .map(|prop| walk_property_shape(graph, prop.as_ref(), depth))
+    // Flatten every expanded shape's sh:property list, dropping deactivated
+    // property shapes, then group by resolved path — a complex (blank-node)
+    // path gets its own singleton group rather than merging with anything,
+    // since "the same complex path" is not a concept this crate resolves.
+    let mut order_seen: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<Subject>> = HashMap::new();
+    let mut singleton = 0usize;
+    for s in &expanded {
+        for prop in graph.objects_for_subject_predicate(s.as_ref(), sh::PROPERTY) {
+            let Some(prop_subject) = as_subject(prop) else {
+                continue;
+            };
+            if graph
+                .object_for_subject_predicate(prop_subject.as_ref(), sh::DEACTIVATED)
+                .is_some_and(is_true)
+            {
+                continue;
+            }
+            let key = match resolved_path_key(graph, prop_subject.as_ref()) {
+                Some(k) => k,
+                None => {
+                    singleton += 1;
+                    format!(
+                        "\u{0}complex-path-{}-{singleton}",
+                        shape_key(prop_subject.as_ref())
+                    )
+                }
+            };
+            if !groups.contains_key(&key) {
+                order_seen.push(key.clone());
+            }
+            groups.entry(key).or_default().push(prop_subject);
+        }
+    }
+
+    let mut fields: Vec<Field> = order_seen
+        .into_iter()
+        .filter_map(|k| groups.remove(&k))
+        .map(|members| build_field(graph, &members, depth, cache))
         .collect();
     // `sh:order` first, absent order last (`order_key` maps `None` to
     // +infinity — the opposite of `Option`'s own derived ordering, which
@@ -132,7 +271,17 @@ fn walk_node_shape(graph: &Graph, shape: SubjectRef<'_>, depth: u32) -> FormSche
             .then_with(|| tie_break_key(a).cmp(tie_break_key(b)))
     });
     schema.fields = fields;
-    schema
+
+    let rc = Rc::new(schema);
+    cache.insert(cache_key, rc.clone());
+    rc
+}
+
+fn resolved_path_key(graph: &Graph, prop: SubjectRef<'_>) -> Option<String> {
+    match graph.object_for_subject_predicate(prop, sh::PATH) {
+        Some(TermRef::NamedNode(n)) => Some(n.as_str().to_string()),
+        _ => None,
+    }
 }
 
 /// Property shapes this crate reads a constraint from directly. Anything
@@ -165,20 +314,27 @@ const KNOWN_PROPERTY_SHAPE_PREDS: &[NamedNodeRef<'static>] = &[
     sh::AND,
     sh::NOT,
     sh::XONE,
+    sh::MESSAGE,
+    sh::SEVERITY,
+    sh::GROUP,
+    sh::DEACTIVATED,
 ];
 
-/// Everything this crate extracted from one property shape's own
-/// constraints, before `resolve_kind` turns it into one [`FieldKind`].
-/// `sh:and` merges into one `Acc` (constraints on the same value can
-/// legitimately combine); `sh:or`/`sh:xone` process only their first
-/// branch (see the crate README's SHACL-coverage table) and note the rest.
+/// Everything this crate extracted from one *group* of property shapes
+/// (ordinarily one, but see [`walk_shapes`]'s path-based grouping) sharing
+/// a path, before `resolve_kind` turns it into one [`FieldKind`]. `sh:and`
+/// — and now every member of a merged group — accumulates into one `Acc`
+/// by tightening/merging rather than overwriting (a later `sh:maxLength 5`
+/// no longer silently loosens an earlier `sh:maxLength 50`); `sh:or`/
+/// `sh:xone` process only their first branch (see the crate README's
+/// SHACL-coverage table) and note the rest.
 #[derive(Default)]
 struct Acc {
     datatype: Option<NamedNode>,
     class: Option<NamedNode>,
     node: Option<Term>,
     node_kind: Option<NamedNode>,
-    pattern: Option<String>,
+    patterns: Vec<String>,
     min_length: Option<u32>,
     max_length: Option<u32>,
     min_inclusive: Option<f64>,
@@ -190,50 +346,83 @@ struct Acc {
     unsupported: Vec<String>,
 }
 
-fn walk_property_shape(graph: &Graph, prop: SubjectRef<'_>, depth: u32) -> Field {
-    let path_term = graph.object_for_subject_predicate(prop, sh::PATH);
+/// One field for `members` (all sharing one resolved path, or a single
+/// complex-path property shape in a singleton group of its own — see
+/// [`walk_shapes`]). Name/description/order/default value come from the
+/// first member that states one; cardinality merges by tightening
+/// (`min_count` = the loosest member's floor is not enough, every member's
+/// own minimum must hold, so the max across members; `max_count` = the
+/// tightest ceiling any member states, so the min of the stated ones);
+/// every other constraint accumulates into one [`Acc`] the same way
+/// `sh:and`'s branches already did.
+fn build_field(graph: &Graph, members: &[Subject], depth: u32, cache: &mut ShapeCache) -> Field {
+    let path_term = graph.object_for_subject_predicate(members[0].as_ref(), sh::PATH);
     let path = path_term.and_then(|p| match p {
         TermRef::NamedNode(n) => Some(n.into_owned()),
         _ => None,
     });
-    let complex_path_reason = path_term
+    let mut unsupported = Vec::new();
+    if let Some(reason) = path_term
         .filter(|p| !p.is_named_node())
-        .map(|p| complex_path_reason(graph, p));
-
-    let label =
-        literal_string(graph.object_for_subject_predicate(prop, sh::NAME)).unwrap_or_else(|| {
-            path.as_ref()
-                .map(|p| local_name(p.as_str()).to_string())
-                .unwrap_or_else(|| "value".to_string())
-        });
-    let description = literal_string(graph.object_for_subject_predicate(prop, sh::DESCRIPTION));
-    let order = graph
-        .object_for_subject_predicate(prop, sh::ORDER)
-        .and_then(literal_f64);
-    let min_count = graph
-        .object_for_subject_predicate(prop, sh::MIN_COUNT)
-        .and_then(literal_u32)
-        .unwrap_or(0);
-    let max_count = graph
-        .object_for_subject_predicate(prop, sh::MAX_COUNT)
-        .and_then(literal_u32);
-    let default_value = graph
-        .object_for_subject_predicate(prop, sh::DEFAULT_VALUE)
-        .map(TermRef::into_owned);
-
-    let mut acc = Acc::default();
-    if let Some(reason) = complex_path_reason {
-        acc.unsupported.push(format!(
+        .map(|p| complex_path_reason(graph, p))
+    {
+        unsupported.push(format!(
             "sh:path is {reason}, not a single predicate — this field cannot be edited"
         ));
     }
-    collect_constraints(graph, prop, &mut acc);
 
-    let mut unsupported = acc.unsupported.clone();
-    record_unknown_predicates(graph, prop, KNOWN_PROPERTY_SHAPE_PREDS, &mut unsupported);
+    let mut label = None;
+    let mut description = None;
+    let mut order = None;
+    let mut default_value = None;
+    let mut min_count = 0u32;
+    let mut max_count: Option<u32> = None;
+    let mut acc = Acc::default();
+
+    for member in members {
+        let member = member.as_ref();
+        if label.is_none() {
+            label = literal_string(graph.object_for_subject_predicate(member, sh::NAME));
+        }
+        if description.is_none() {
+            description =
+                literal_string(graph.object_for_subject_predicate(member, sh::DESCRIPTION));
+        }
+        if order.is_none() {
+            order = graph
+                .object_for_subject_predicate(member, sh::ORDER)
+                .and_then(literal_f64);
+        }
+        if default_value.is_none() {
+            default_value = graph
+                .object_for_subject_predicate(member, sh::DEFAULT_VALUE)
+                .map(TermRef::into_owned);
+        }
+        min_count = min_count.max(
+            graph
+                .object_for_subject_predicate(member, sh::MIN_COUNT)
+                .and_then(literal_u32)
+                .unwrap_or(0),
+        );
+        if let Some(this_max) = graph
+            .object_for_subject_predicate(member, sh::MAX_COUNT)
+            .and_then(literal_u32)
+        {
+            max_count = Some(max_count.map_or(this_max, |m| m.min(this_max)));
+        }
+        record_unknown_predicates(graph, member, KNOWN_PROPERTY_SHAPE_PREDS, &mut unsupported);
+        collect_constraints(graph, member, &mut acc, 0);
+    }
+
+    let label = label.unwrap_or_else(|| {
+        path.as_ref()
+            .map(|p| local_name(p.as_str()).to_string())
+            .unwrap_or_else(|| "value".to_string())
+    });
+    unsupported.extend(acc.unsupported.clone());
 
     let original_datatype = acc.datatype.clone();
-    let kind = resolve_kind(graph, &acc, depth, &mut unsupported);
+    let kind = resolve_kind(graph, &acc, depth, cache, &mut unsupported);
 
     Field {
         path,
@@ -250,74 +439,131 @@ fn walk_property_shape(graph: &Graph, prop: SubjectRef<'_>, depth: u32) -> Field
 }
 
 /// Reads the simple (non-combinator) constraints directly on `node` into
-/// `acc`, then recurses into `sh:and`/`sh:or`/`sh:xone`/`sh:not` found on
-/// the same node. Called once for the property shape itself, and again
-/// (accumulating into the *same* `acc`) for each `sh:and` branch — which is
-/// what lets `sh:and ( [ sh:datatype xsd:string ] [ sh:pattern "^a" ] )`
-/// merge into one `Text` field instead of two competing ones.
-fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc) {
-    if let Some(TermRef::NamedNode(dt)) = graph.object_for_subject_predicate(node, sh::DATATYPE) {
-        acc.datatype = Some(dt.into_owned());
+/// `acc` — merging with whatever `acc` already holds (from an earlier
+/// member of the same field group, or an enclosing `sh:and`) rather than
+/// overwriting it — then recurses into `sh:and`/`sh:or`/`sh:xone`/`sh:not`
+/// found on the same node. `combinator_depth` bounds that recursion (see
+/// [`MAX_COMBINATOR_DEPTH`]); it has nothing to do with [`MAX_NESTING_DEPTH`],
+/// which bounds `sh:node`/`sh:class` value-nesting instead.
+fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc, combinator_depth: u32) {
+    if combinator_depth > MAX_COMBINATOR_DEPTH {
+        acc.unsupported.push(
+            "constraint combinators (sh:and/sh:or/sh:xone) nested too deep; stopped".to_string(),
+        );
+        return;
     }
-    if let Some(TermRef::NamedNode(c)) = graph.object_for_subject_predicate(node, sh::CLASS) {
-        acc.class = Some(c.into_owned());
-    }
-    if let Some(n) = graph.object_for_subject_predicate(node, sh::NODE) {
-        acc.node = Some(n.into_owned());
-    }
-    if let Some(TermRef::NamedNode(nk)) = graph.object_for_subject_predicate(node, sh::NODE_KIND) {
-        acc.node_kind = Some(nk.into_owned());
-    }
+
+    set_or_report_conflict(
+        &mut acc.datatype,
+        graph
+            .object_for_subject_predicate(node, sh::DATATYPE)
+            .and_then(as_named_node),
+        "sh:datatype",
+        &mut acc.unsupported,
+    );
+    set_or_report_conflict(
+        &mut acc.class,
+        graph
+            .object_for_subject_predicate(node, sh::CLASS)
+            .and_then(as_named_node),
+        "sh:class",
+        &mut acc.unsupported,
+    );
+    set_or_report_conflict_term(
+        &mut acc.node,
+        graph
+            .object_for_subject_predicate(node, sh::NODE)
+            .map(TermRef::into_owned),
+        "sh:node",
+        &mut acc.unsupported,
+    );
+    set_or_report_conflict(
+        &mut acc.node_kind,
+        graph
+            .object_for_subject_predicate(node, sh::NODE_KIND)
+            .and_then(as_named_node),
+        "sh:nodeKind",
+        &mut acc.unsupported,
+    );
+
     if let Some(p) = literal_string(graph.object_for_subject_predicate(node, sh::PATTERN)) {
-        acc.pattern = Some(p);
+        acc.patterns.push(p);
+    }
+    if graph
+        .object_for_subject_predicate(node, sh::FLAGS)
+        .is_some()
+    {
+        acc.unsupported.push("sh:flags is stated but not applied to the rendered pattern (case-insensitive/other flag semantics are not translated to the HTML control)".to_string());
     }
     if let Some(n) = graph
         .object_for_subject_predicate(node, sh::MIN_LENGTH)
         .and_then(literal_u32)
     {
-        acc.min_length = Some(n);
+        acc.min_length = Some(acc.min_length.map_or(n, |e| e.max(n)));
     }
     if let Some(n) = graph
         .object_for_subject_predicate(node, sh::MAX_LENGTH)
         .and_then(literal_u32)
     {
-        acc.max_length = Some(n);
+        acc.max_length = Some(acc.max_length.map_or(n, |e| e.min(n)));
     }
     if let Some(n) = graph
         .object_for_subject_predicate(node, sh::MIN_INCLUSIVE)
         .and_then(literal_f64)
     {
-        acc.min_inclusive = Some(n);
+        acc.min_inclusive = Some(acc.min_inclusive.map_or(n, |e| e.max(n)));
     }
     if let Some(n) = graph
         .object_for_subject_predicate(node, sh::MAX_INCLUSIVE)
         .and_then(literal_f64)
     {
-        acc.max_inclusive = Some(n);
+        acc.max_inclusive = Some(acc.max_inclusive.map_or(n, |e| e.min(n)));
     }
     if let Some(n) = graph
         .object_for_subject_predicate(node, sh::MIN_EXCLUSIVE)
         .and_then(literal_f64)
     {
-        acc.min_exclusive = Some(n);
+        acc.min_exclusive = Some(acc.min_exclusive.map_or(n, |e| e.max(n)));
     }
     if let Some(n) = graph
         .object_for_subject_predicate(node, sh::MAX_EXCLUSIVE)
         .and_then(literal_f64)
     {
-        acc.max_exclusive = Some(n);
+        acc.max_exclusive = Some(acc.max_exclusive.map_or(n, |e| e.min(n)));
     }
     if let Some(head) = graph.object_for_subject_predicate(node, sh::IN) {
-        acc.in_list = Some(rdf_list(graph, head));
+        let list = rdf_list(graph, head);
+        match &acc.in_list {
+            None => acc.in_list = Some(list),
+            Some(existing) if existing == &list => {}
+            Some(_) => acc
+                .unsupported
+                .push("sh:and combines conflicting sh:in lists; keeping the first".to_string()),
+        }
     }
-    if let Some(v) = graph.object_for_subject_predicate(node, sh::HAS_VALUE) {
-        acc.has_value = Some(v.into_owned());
+    if let Some(v) = graph
+        .object_for_subject_predicate(node, sh::HAS_VALUE)
+        .map(TermRef::into_owned)
+    {
+        match &acc.has_value {
+            None => acc.has_value = Some(v),
+            Some(existing) if existing == &v => {}
+            Some(_) => acc
+                .unsupported
+                .push("sh:and combines conflicting sh:hasValue; keeping the first".to_string()),
+        }
     }
 
     if let Some(head) = graph.object_for_subject_predicate(node, sh::AND) {
         for branch in rdf_list(graph, head) {
             if let Some(s) = as_subject_term(&branch) {
-                collect_constraints(graph, s.as_ref(), acc);
+                record_unknown_predicates(
+                    graph,
+                    s.as_ref(),
+                    KNOWN_PROPERTY_SHAPE_PREDS,
+                    &mut acc.unsupported,
+                );
+                collect_constraints(graph, s.as_ref(), acc, combinator_depth + 1);
             }
         }
     }
@@ -325,7 +571,13 @@ fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc) {
         if let Some(head) = graph.object_for_subject_predicate(node, pred) {
             let branches = rdf_list(graph, head);
             if let Some(first) = branches.first().and_then(as_subject_term) {
-                collect_constraints(graph, first.as_ref(), acc);
+                record_unknown_predicates(
+                    graph,
+                    first.as_ref(),
+                    KNOWN_PROPERTY_SHAPE_PREDS,
+                    &mut acc.unsupported,
+                );
+                collect_constraints(graph, first.as_ref(), acc, combinator_depth + 1);
             }
             if branches.len() > 1 {
                 acc.unsupported.push(format!(
@@ -341,27 +593,80 @@ fn collect_constraints(graph: &Graph, node: SubjectRef<'_>, acc: &mut Acc) {
     }
 }
 
-fn resolve_kind(graph: &Graph, acc: &Acc, depth: u32, unsupported: &mut Vec<String>) -> FieldKind {
+fn set_or_report_conflict(
+    slot: &mut Option<NamedNode>,
+    new: Option<NamedNode>,
+    label: &str,
+    unsupported: &mut Vec<String>,
+) {
+    let Some(new) = new else { return };
+    match slot {
+        None => *slot = Some(new),
+        Some(existing) if *existing == new => {}
+        Some(existing) => unsupported.push(format!(
+            "sh:and combines conflicting {label} (<{}> vs <{}>); keeping the first",
+            existing.as_str(),
+            new.as_str()
+        )),
+    }
+}
+
+fn set_or_report_conflict_term(
+    slot: &mut Option<Term>,
+    new: Option<Term>,
+    label: &str,
+    unsupported: &mut Vec<String>,
+) {
+    let Some(new) = new else { return };
+    match slot {
+        None => *slot = Some(new),
+        Some(existing) if *existing == new => {}
+        Some(_) => unsupported.push(format!(
+            "sh:and combines conflicting {label}; keeping the first"
+        )),
+    }
+}
+
+fn as_named_node(term: TermRef<'_>) -> Option<NamedNode> {
+    match term {
+        TermRef::NamedNode(n) => Some(n.into_owned()),
+        _ => None,
+    }
+}
+
+fn resolve_kind(
+    graph: &Graph,
+    acc: &Acc,
+    depth: u32,
+    cache: &mut ShapeCache,
+    unsupported: &mut Vec<String>,
+) -> FieldKind {
     if let Some(node) = &acc.node {
-        return nest(graph, node, depth, unsupported).unwrap_or_else(|| {
-            fallback_iri(
+        return match as_subject_term(node) {
+            Some(subject) => nest_shapes(graph, vec![subject], None, depth, cache, unsupported),
+            None => fallback_iri(
                 unsupported,
-                format!("sh:node <{node}> could not be expanded"),
-            )
-        });
+                format!("sh:node <{node}> is not a shape reference"),
+            ),
+        };
     }
     if let Some(class) = &acc.class {
-        if let Some(shape) = find_node_shape_for_class(graph, class.as_ref()) {
-            let shape_term = subject_to_term(&shape);
-            if let Some(k) = nest(graph, &shape_term, depth, unsupported) {
-                return k;
-            }
+        let shapes = find_node_shapes_for_class(graph, class.as_ref());
+        if shapes.is_empty() {
+            unsupported.push(format!(
+                "no sh:NodeShape has sh:targetClass <{}>; rendered as a plain IRI field",
+                class.as_str()
+            ));
+            return FieldKind::Iri;
         }
-        unsupported.push(format!(
-            "no sh:NodeShape has sh:targetClass <{}>; rendered as a plain IRI field",
-            class.as_str()
-        ));
-        return FieldKind::Iri;
+        return nest_shapes(
+            graph,
+            shapes,
+            Some(class.clone()),
+            depth,
+            cache,
+            unsupported,
+        );
     }
     if let Some(list) = &acc.in_list {
         return FieldKind::Select {
@@ -386,10 +691,7 @@ fn resolve_kind(graph: &Graph, acc: &Acc, depth: u32, unsupported: &mut Vec<Stri
             || r == sh::BLANK_NODE_OR_IRI
             || r == sh::BLANK_NODE_OR_LITERAL
         {
-            unsupported.push(format!(
-                "sh:nodeKind {} allows more than one kind of value; this form only offers free text",
-                local_name(nk.as_str())
-            ));
+            unsupported.push(format!("sh:nodeKind {} allows more than one kind of value; this form only offers free text", local_name(nk.as_str())));
         }
     }
     if let Some(dt) = &acc.datatype {
@@ -399,7 +701,7 @@ fn resolve_kind(graph: &Graph, acc: &Acc, depth: u32, unsupported: &mut Vec<Stri
                 dt.as_str()
             ));
             FieldKind::Text {
-                pattern: None,
+                patterns: Vec::new(),
                 min_length: None,
                 max_length: None,
             }
@@ -429,28 +731,28 @@ fn resolve_kind(graph: &Graph, acc: &Acc, depth: u32, unsupported: &mut Vec<Stri
     apply_text_constraints(
         acc,
         FieldKind::Text {
-            pattern: None,
+            patterns: Vec::new(),
             min_length: None,
             max_length: None,
         },
     )
 }
 
-fn nest(
+fn nest_shapes(
     graph: &Graph,
-    node: &Term,
+    shapes: Vec<Subject>,
+    target_class: Option<NamedNode>,
     depth: u32,
+    cache: &mut ShapeCache,
     unsupported: &mut Vec<String>,
-) -> Option<FieldKind> {
+) -> FieldKind {
     if depth >= MAX_NESTING_DEPTH {
         unsupported.push(format!("nesting stopped at depth {MAX_NESTING_DEPTH}"));
-        return None;
+        return FieldKind::Iri;
     }
-    let subject = as_subject_term(node)?;
-    let nested = walk_node_shape(graph, subject.as_ref(), depth + 1);
-    Some(FieldKind::Nested {
-        schema: Box::new(nested),
-    })
+    FieldKind::Nested {
+        schema: walk_shapes(graph, shapes, target_class, depth + 1, cache),
+    }
 }
 
 fn fallback_iri(unsupported: &mut Vec<String>, reason: String) -> FieldKind {
@@ -458,19 +760,27 @@ fn fallback_iri(unsupported: &mut Vec<String>, reason: String) -> FieldKind {
     FieldKind::Iri
 }
 
+/// Turns SHACL's `sh:minExclusive`/`sh:maxExclusive` into the inclusive
+/// bound HTML's `min`/`max` actually understand. Exact for an integer field
+/// (`sh:minExclusive 0` becomes `min=1`, so 0 itself is correctly rejected);
+/// approximated as the same value for a decimal/float field, where there is
+/// no single "next representable value" to bump by — a known gap (see the
+/// README), not silently pretended away: the bound is still tighter than
+/// nothing, just not exact.
 fn apply_numeric_bounds(acc: &Acc, kind: FieldKind) -> FieldKind {
     match kind {
         FieldKind::Number { integer_only, .. } => {
-            let min = match (acc.min_inclusive, acc.min_exclusive) {
-                (Some(v), _) => Some(v),
-                (None, Some(v)) => Some(v),
-                (None, None) => None,
-            };
-            let max = match (acc.max_inclusive, acc.max_exclusive) {
-                (Some(v), _) => Some(v),
-                (None, Some(v)) => Some(v),
-                (None, None) => None,
-            };
+            let bump = if integer_only { 1.0 } else { 0.0 };
+            let min = combine_bound(
+                acc.min_inclusive,
+                acc.min_exclusive.map(|v| v + bump),
+                f64::max,
+            );
+            let max = combine_bound(
+                acc.max_inclusive,
+                acc.max_exclusive.map(|v| v - bump),
+                f64::min,
+            );
             FieldKind::Number {
                 integer_only,
                 min,
@@ -481,10 +791,19 @@ fn apply_numeric_bounds(acc: &Acc, kind: FieldKind) -> FieldKind {
     }
 }
 
+fn combine_bound(a: Option<f64>, b: Option<f64>, tighten: impl Fn(f64, f64) -> f64) -> Option<f64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(tighten(x, y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
+    }
+}
+
 fn apply_text_constraints(acc: &Acc, kind: FieldKind) -> FieldKind {
     match kind {
         FieldKind::Text { .. } => FieldKind::Text {
-            pattern: acc.pattern.clone(),
+            patterns: acc.patterns.clone(),
             min_length: acc.min_length,
             max_length: acc.max_length,
         },
@@ -495,7 +814,7 @@ fn apply_text_constraints(acc: &Acc, kind: FieldKind) -> FieldKind {
 fn kind_for_datatype(dt: &NamedNode) -> Option<FieldKind> {
     let r = dt.as_ref();
     let text = || FieldKind::Text {
-        pattern: None,
+        patterns: Vec::new(),
         min_length: None,
         max_length: None,
     };
@@ -590,11 +909,21 @@ fn record_unknown_predicates(
     }
 }
 
+/// Walks an `rdf:List` (`sh:in`'s value, `sh:and`/`sh:or`/`sh:xone`'s
+/// branch list) into a `Vec`. Guards against a cyclic or self-referencing
+/// list (`_:l rdf:first ex:a ; rdf:rest _:l`) with a visited set: without
+/// one, such a list — malformed, but not something this crate should ever
+/// trust a pasted shapes graph not to contain — grows `out` and loops
+/// forever rather than erroring.
 fn rdf_list(graph: &Graph, head: TermRef<'_>) -> Vec<Term> {
     let mut out = Vec::new();
     let mut current = head.into_owned();
+    let mut visited = HashSet::new();
     loop {
         if matches!(&current, Term::NamedNode(n) if n.as_ref() == rdf::NIL) {
+            break;
+        }
+        if !visited.insert(current.clone()) {
             break;
         }
         let Some(subject) = as_subject_term(&current) else {
@@ -621,13 +950,6 @@ fn as_subject_term(term: &Term) -> Option<Subject> {
         Term::NamedNode(n) => Some(Subject::NamedNode(n.clone())),
         Term::BlankNode(b) => Some(Subject::BlankNode(b.clone())),
         _ => None,
-    }
-}
-
-fn subject_to_term(subject: &Subject) -> Term {
-    match subject {
-        Subject::NamedNode(n) => Term::NamedNode(n.clone()),
-        Subject::BlankNode(b) => Term::BlankNode(b.clone()),
     }
 }
 

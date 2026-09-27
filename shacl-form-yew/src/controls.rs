@@ -35,15 +35,18 @@ fn select_value(e: Event) -> String {
 /// whatever the browser hands back on input into the [`ValueEntry`] that
 /// same kind expects — the two are written together deliberately, so a new
 /// `FieldKind` variant cannot add a control without also saying how its
-/// input becomes a value.
+/// input becomes a value. `on_clear` fires only from `Select`'s own "—"
+/// (no selection) option — see its own doc comment for why that can't just
+/// be another `onchange` value.
 pub fn render_control(
     field: &Field,
     current: Option<&ValueEntry>,
     onchange: Callback<ValueEntry>,
+    on_clear: Callback<()>,
 ) -> Html {
     match &field.kind {
         FieldKind::Text {
-            pattern,
+            patterns,
             min_length,
             max_length,
         } => {
@@ -52,7 +55,7 @@ pub fn render_control(
                 onchange.reform(move |e: InputEvent| literal_entry(&field, &input_value(e)));
             html! {
                 <input type="text" value={lexical(current)} oninput={oninput}
-                    pattern={pattern.clone()}
+                    pattern={combined_pattern(patterns)}
                     minlength={min_length.map(|n| n.to_string())}
                     maxlength={max_length.map(|n| n.to_string())} />
             }
@@ -102,18 +105,30 @@ pub fn render_control(
         }
         FieldKind::Select { options } => {
             let current_str = lexical(current);
-            let options = options.clone();
             let owned = options.clone();
-            let onchange = onchange.reform(move |e: Event| {
+            // Picking "—" (no selection) must REMOVE this entry, not write
+            // one holding an empty literal (`""`) — an empty string is a
+            // real, if useless, value, and serialising it satisfies
+            // `sh:minCount` for nothing. `select_value` returning "" is
+            // unambiguous here: no real option's own value is ever the
+            // empty string (SHACL's own `sh:in`/`sh:hasValue` terms are
+            // IRIs or non-empty literals), so "the user picked the blank
+            // option" and "onchange somehow got a stray empty string" are
+            // the same case and both mean "clear".
+            let onselect = Callback::from(move |e: Event| {
                 let chosen = select_value(e);
-                owned
+                if chosen.is_empty() {
+                    on_clear.emit(());
+                } else if let Some(entry) = owned
                     .iter()
                     .find(|o| term_as_string(&o.value) == chosen)
                     .map(|o| term_to_entry(&o.value))
-                    .unwrap_or_else(|| ValueEntry::Literal(Literal::new_simple_literal(chosen)))
+                {
+                    onchange.emit(entry);
+                }
             });
             html! {
-                <select onchange={onchange}>
+                <select onchange={onselect}>
                     <option value="" selected={current_str.is_empty()}>{ "—" }</option>
                     { for options.iter().map(|o| {
                         let v = term_as_string(&o.value);
@@ -124,6 +139,22 @@ pub fn render_control(
         }
         FieldKind::Nested { .. } => html! {}, // rendered by crate::render, never here
     }
+}
+
+/// SHACL's `sh:pattern` is an *unanchored* search (the value merely needs
+/// to contain a match somewhere) using XPath/JS-flavoured regex; HTML's own
+/// `pattern` attribute always matches the *whole* value (the browser wraps
+/// it as `^(?:…)$`). Wrapping each pattern in a zero-width lookahead
+/// (`(?=.*(?:p))`) and ending in a bare `.*` reproduces "contains a match
+/// for every pattern, in any order, anywhere" under that anchored
+/// wrapping — and composes multiple patterns (from `sh:and`) as a
+/// conjunction instead of only being able to state one.
+fn combined_pattern(patterns: &[String]) -> Option<String> {
+    if patterns.is_empty() {
+        return None;
+    }
+    let lookaheads: String = patterns.iter().map(|p| format!("(?=.*(?:{p}))")).collect();
+    Some(format!("{lookaheads}.*"))
 }
 
 fn term_as_string(term: &Term) -> String {

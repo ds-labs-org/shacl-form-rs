@@ -170,14 +170,14 @@ fn sh_and_merges_constraints_from_every_branch_onto_one_field() {
         "#,
     );
     let FieldKind::Text {
-        pattern,
+        patterns,
         min_length,
         ..
     } = &schema.fields[0].kind
     else {
         panic!("expected Text, got {:?}", schema.fields[0].kind)
     };
-    assert_eq!(pattern.as_deref(), Some("^[A-Z]+$"));
+    assert_eq!(patterns.as_slice(), ["^[A-Z]+$"]);
     assert_eq!(*min_length, Some(2));
 }
 

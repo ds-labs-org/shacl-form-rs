@@ -58,4 +58,14 @@ sh_terms! {
     ZERO_OR_MORE_PATH => "zeroOrMorePath",
     ONE_OR_MORE_PATH => "oneOrMorePath",
     ZERO_OR_ONE_PATH => "zeroOrOnePath",
+    // Not constraints at all — validation-result metadata (message,
+    // severity, SHACL-UI grouping hint) and the deactivation switch. None of
+    // these say anything about what a valid value looks like, so treating
+    // them as "unrecognised constraints" was itself a bug: a real shapes
+    // graph states sh:message on nearly every property, and flagging each
+    // one drowns out the constraints that actually matter.
+    MESSAGE => "message",
+    SEVERITY => "severity",
+    GROUP => "group",
+    DEACTIVATED => "deactivated",
 }

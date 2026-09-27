@@ -60,31 +60,47 @@ see `shacl-form-core/tests/honeycomb.rs`), not just hand-written fixtures.
 | `sh:nodeKind sh:IRI` | `Iri`; `BlankNode`/mixed kinds reported unsupported, rendered as text |
 | `sh:in` | `Select`, options exactly as listed |
 | `sh:hasValue` | `Select` with that one option |
-| `sh:node` / `sh:class` (resolved via a matching `sh:targetClass`) | `Nested`, recursively — depth-bounded (see `MAX_NESTING_DEPTH`'s own doc comment), so a shape nested inside itself still terminates instead of refusing to render at all |
-| `sh:and` | merges every branch's constraints onto one field |
+| `sh:node` / `sh:class` (resolved via every matching `sh:targetClass` shape, merged) | `Nested`, recursively — depth-bounded (see `MAX_NESTING_DEPTH`'s own doc comment) and cached by `(shape set, depth)` so a shape nested inside itself expands to one schema per depth level, shared, not a re-walked copy per occurrence |
+| `sh:node` / `sh:and` **on the node shape itself** ("shape inheritance": `ex:EmployeeShape sh:node ex:PersonShape`) | the referenced shape's own `sh:property` list is pulled in and merged, the same as a sibling shape sharing a `sh:targetClass` |
+| two `sh:property` values sharing one `sh:path` — in one shape, or across a merged `sh:targetClass`/inheritance set | merged into **one** field (tightening cardinality and constraints), not two competing fields writing duplicate triples |
+| `sh:and` | merges every branch's constraints onto one field, **tightening** (the smallest `maxLength`/`maxInclusive`, the largest `minLength`/`minInclusive`, every `sh:pattern` kept, not just the last) rather than the last branch silently overwriting an earlier, stricter one |
 | `sh:or` / `sh:xone` | renders the **first** branch only; the rest are named in the field's `unsupported` note |
-| `sh:not`, `sh:sparql`, `sh:disjoint`, `sh:equals`, `sh:lessThan`, `sh:qualifiedValueShape`, any other `sh:`-namespaced predicate this crate doesn't branch on | reported, on the field or the shape, never silently dropped |
+| `sh:not`, `sh:sparql`, `sh:disjoint`, `sh:equals`, `sh:lessThan`, `sh:qualifiedValueShape`, `sh:flags`, any other `sh:`-namespaced predicate this crate doesn't branch on | reported, on the field or the shape, never silently dropped |
+| `sh:message`, `sh:severity`, `sh:group`, `sh:deactivated` | not constraints — never reported as "unsupported"; a `sh:deactivated true` property is skipped entirely, per spec |
 | `sh:minCount`/`sh:maxCount` | repeatable add/remove controls; a required field starts pre-filled, not an empty list |
-| `sh:minLength`/`maxLength`/`pattern`/`minInclusive`/`maxInclusive`/`minExclusive`/`maxExclusive` | HTML `pattern`/`minlength`/`maxlength`/`min`/`max` |
+| `sh:minLength`/`maxLength`/`pattern`/`minInclusive`/`maxInclusive`/`minExclusive`/`maxExclusive` | HTML `minlength`/`maxlength`/`min`/`max`, and `pattern` rebuilt as an unanchored-contains match (SHACL's own semantics — see `controls.rs`'s `combined_pattern`), not HTML's anchored one |
 | `sh:defaultValue` | pre-fills a new instance (never overwrites an edited one) |
 | `sh:order` | sorts fields; absent order sorts last, tie-broken by predicate for determinism (`oxrdf::Graph` iterates in an interned, not insertion, order — see `schema.rs`'s own `order_key`/`tie_break_key` docs) |
-| more than one `sh:NodeShape` sharing a `sh:targetClass` | merged into one form (`from_target_class`) — a real shape in `ds-honeycomb-editor-rs`'s own `shapes.ttl` |
+| more than one `sh:NodeShape` sharing a `sh:targetClass` | merged into one form (`from_target_class`), regardless of which shape happens to sort first |
+| `rdf:type` for a `from_target_class` form's own subject, and for a `sh:class`-nested value | asserted on submit (`FormSchema::target_class`) — otherwise the produced instance would not conform to the very constraint that shaped it |
+| re-saving an untouched value nested under `sh:node`/`sh:class` (edit mode) | reuses the subject it was read from (`ValueEntry::Nested`'s own `subject`); does not replace it with a fresh blank node |
 
 Nothing here is silently approximated: a construct this crate can't
 faithfully turn into a control is named in `Field::unsupported` /
 `FormSchema::unsupported`, and `FormSchema::all_unsupported()` flattens the
-whole tree for a host that just wants one list to show a reader.
+whole tree for a host that just wants one list to show a reader (and does so
+in time proportional to the tree's *distinct* schemas, not to how many
+`Nested` fields happen to point at a shared one — see its own doc comment).
 
 ## Known limitations
 
 - `sh:or`/`sh:xone` render only their first branch.
+- `sh:flags` (e.g. case-insensitive matching) is reported but not applied to
+  the rendered pattern.
+- An exclusive numeric bound (`sh:minExclusive`/`sh:maxExclusive`) becomes an
+  exact inclusive HTML bound for an **integer** field (`minExclusive 0` →
+  `min=1`); for a decimal/float field there is no single "next representable
+  value" to bump by, so it is approximated as the same inclusive bound —
+  tighter than nothing, not exact.
 - Serialised numeric/date/boolean literals use the field's own
   `sh:datatype` when the shape stated one, otherwise a canonical datatype
   per `FieldKind` (e.g. plain `xsd:integer` for an untyped numeric bound) —
   not a full type-inference pass.
-- No client-side IRI validation on the `Iri` control (accepts any string);
-  no enforcement of `sh:closed`/`sh:disjoint`/`sh:equals`/`sh:lessThan`/
-  `sh:sparql` at all (see the coverage table).
+- The `Iri` control accepts free text as you type (a half-typed IRI
+  shouldn't fight you mid-keystroke); an invalid one is silently skipped at
+  *serialisation* time rather than written as unparseable Turtle.
+- No enforcement of `sh:closed`/`sh:disjoint`/`sh:equals`/`sh:lessThan`/
+  `sh:sparql`/`sh:qualifiedValueShape` at all (see the coverage table).
 - No `demo-ssg` (a host-only static pre-render, the way
   `ds-honeycomb-editor-rs` has one) yet.
 - `shacl-form-yew` ships no CSS at all — the host supplies class names
@@ -92,6 +108,34 @@ whole tree for a host that just wants one list to show a reader.
   `shacl-form-error`, `shacl-form-unsupported`, `shacl-form-required`,
   `shacl-form-add`/`shacl-form-remove`) the same way `ds-honeycomb-editor-rs`
   leaves colour and theme to its host.
+
+## Design notes (why it's built this way)
+
+- **State is one `Reducible` (`FormState`/`FormAction`, in `paths.rs`), not
+  a directly-captured `FormValues` snapshot.** Yew defers a state update to
+  a microtask; two edits dispatched synchronously (a script filling several
+  fields, a test driver) would, against a captured snapshot, each build on
+  the *pre-edit* state and the second `set()` would silently overwrite the
+  first. A reducer applies each dispatched action to whatever is actually
+  current when it is processed — see `shacl-form-yew/tests/dom.rs`'s
+  `two_edits_dispatched_before_any_rerender_both_survive` for the case this
+  fixes, reproduced and pinned in a real browser.
+- **Every field's value row is `Rc<[ValueEntry]>`, and a `Nested` value
+  carries its own `Rc<FormValues>`** (`shacl_form_core::FormValues`), so
+  rebuilding the tree for one edit three levels deep clones the *spine*
+  down to that field — a handful of pointer bumps per level — and shares
+  every other field's row and every other nested repetition unchanged,
+  rather than deep-copying the whole form on every keystroke.
+- **Every expansion of a `sh:node`/`sh:class` reference is cached by
+  `(expanded shape set, target class, nesting depth)`** in `schema.rs`'s
+  `ShapeCache`. Without it, a shape with a handful of self-referencing
+  properties (`foaf:knows` pointing back at `foaf:Person`, say) expands to
+  roughly (branching factor)^`MAX_NESTING_DEPTH` real allocations — tens of
+  thousands for a shape with four such properties — because every
+  occurrence re-walked and re-allocated an identical subtree. With the
+  cache, the same shape reached the same way at the same depth is computed
+  once and shared; see `shacl-form-core/tests/robustness.rs`'s own
+  `a_self_referencing_shape_with_several_such_properties_does_not_expand_exponentially`.
 
 ## Requirements
 

@@ -111,7 +111,13 @@ fn a_filled_in_form_serialises_and_reads_back_the_same_values() {
         friend_name_idx,
         vec![ValueEntry::Literal(Literal::new_simple_literal("Bob"))],
     );
-    values.set(friend_idx, vec![ValueEntry::Nested(friend_values)]);
+    values.set(
+        friend_idx,
+        vec![ValueEntry::Nested {
+            subject: None,
+            values: std::rc::Rc::new(friend_values),
+        }],
+    );
 
     let subject = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/alice").unwrap());
     let turtle = values.to_turtle(
@@ -148,11 +154,67 @@ fn a_filled_in_form_serialises_and_reads_back_the_same_values() {
     };
     assert_eq!(age.value(), "30");
     assert_eq!(age.datatype().as_str(), xsd::NON_NEGATIVE_INTEGER.as_str());
-    let ValueEntry::Nested(friend) = &read_back.get(friend_idx)[0] else {
+    let ValueEntry::Nested { values: friend, .. } = &read_back.get(friend_idx)[0] else {
         panic!()
     };
     let ValueEntry::Literal(friend_name) = &friend.get(friend_name_idx)[0] else {
         panic!()
     };
     assert_eq!(friend_name.value(), "Bob");
+}
+
+#[test]
+fn re_saving_an_untouched_nested_value_keeps_its_own_subject_rather_than_minting_a_copy() {
+    // ex:alice ex:knows ex:bob, a *named* node, not a blank one. Reading it
+    // in and immediately re-serialising it (no edits at all) must produce
+    // `ex:alice ex:knows ex:bob` again, not `ex:alice ex:knows _:fresh` with
+    // `ex:bob` quietly orphaned — that used to happen because ValueEntry::Nested
+    // carried no memory of which subject it was read from.
+    let shapes = parse_turtle(SHAPES).unwrap();
+    let shape_iri = NamedNode::new("http://example.org/PersonShape").unwrap();
+    let schema = from_shape_iri(&shapes, &shape_iri).unwrap();
+    let friend_idx = schema
+        .fields
+        .iter()
+        .position(|f| f.label == "friend")
+        .unwrap();
+
+    let instance = parse_instance_turtle(
+        r#"
+        @prefix ex: <http://example.org/> .
+        ex:alice ex:name "Alice" ; ex:knows ex:bob .
+        ex:bob ex:name "Bob" .
+        "#,
+    )
+    .unwrap();
+    let alice = NamedNode::new("http://example.org/alice").unwrap();
+    let values =
+        FormValues::read_from_instance(&schema, &instance, SubjectRef::NamedNode(alice.as_ref()));
+
+    let ValueEntry::Nested { subject, .. } = &values.get(friend_idx)[0] else {
+        panic!()
+    };
+    assert!(
+        subject
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("http://example.org/bob"),
+        "{:?}",
+        subject
+    );
+
+    let turtle = values.to_turtle(
+        &schema,
+        &NamedOrBlankNode::NamedNode(alice),
+        &[("ex", "http://example.org/")],
+    );
+    assert!(
+        turtle.contains("ex:bob") || turtle.contains("<http://example.org/bob>"),
+        "expected the original ex:bob subject to survive re-serialisation:\n{turtle}"
+    );
+    assert!(
+        !turtle.contains("_:"),
+        "no blank node should have been minted for a value that already had a real subject:\n{turtle}"
+    );
 }

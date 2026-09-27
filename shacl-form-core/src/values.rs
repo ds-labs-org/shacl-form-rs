@@ -8,16 +8,23 @@ use oxrdf::{
     BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, SubjectRef, Term, TermRef, TripleRef,
 };
 use oxttl::TurtleSerializer;
+use std::rc::Rc;
 
 /// One entry a field holds. A `Select`/`Iri` field holds `Node` when its
 /// chosen value is a resource and `Literal` when (for `sh:in` over
 /// literals) it is not; a `Nested` field holds one `Nested` entry per
-/// repeated sub-instance.
+/// repeated sub-instance, carrying the subject it was read from (`None` for
+/// a value created fresh in this session, not read from anywhere) so
+/// serialising an edited instance reuses that identity instead of minting a
+/// new blank node that silently replaces it — see `write_triples`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValueEntry {
     Literal(Literal),
     Node(NamedNode),
-    Nested(FormValues),
+    Nested {
+        subject: Option<NamedOrBlankNode>,
+        values: Rc<FormValues>,
+    },
 }
 
 /// Values for one [`FormSchema`], parallel to its `fields` by index — entry
@@ -25,9 +32,17 @@ pub enum ValueEntry {
 /// path because a field with an unsupported (non-single-predicate) path has
 /// no path to key by at all, and still needs somewhere to (not) hold a
 /// value.
+///
+/// Each field's row is an `Rc<[ValueEntry]>`, not a plain `Vec`: an edit
+/// three levels deep in a nested shape (see `shacl-form-yew`'s
+/// `paths::update_at`) rebuilds the *spine* down to that field — cloning
+/// `FormValues` itself at each level on the way — but every other field's
+/// row, at every level, is a pointer bump, not a copy of its contents. A
+/// plain `Vec<Vec<ValueEntry>>` would deep-clone the whole tree (all
+/// literals, all nested repetitions, everywhere) on every single keystroke.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FormValues {
-    entries: Vec<Vec<ValueEntry>>,
+    entries: Vec<Rc<[ValueEntry]>>,
 }
 
 impl FormValues {
@@ -54,7 +69,7 @@ impl FormValues {
                 while (entries.len() as u32) < field.min_count {
                     entries.push(default_entry(field));
                 }
-                entries
+                Rc::from(entries)
             })
             .collect();
         FormValues { entries }
@@ -63,16 +78,19 @@ impl FormValues {
     /// Reads whatever `subject` already asserts for each of `schema`'s
     /// fields out of `graph` — the starting point for an *edit* form. A
     /// `Nested` field's values are read recursively off whichever
-    /// subject(s) `subject` points at through that field's own predicate.
+    /// subject(s) `subject` points at through that field's own predicate,
+    /// and that subject is kept (see [`ValueEntry::Nested`]) so re-saving
+    /// an untouched value reproduces it exactly rather than replacing it
+    /// with a fresh blank node.
     pub fn read_from_instance(schema: &FormSchema, graph: &Graph, subject: SubjectRef<'_>) -> Self {
         let entries = schema
             .fields
             .iter()
             .map(|field| {
                 let Some(path) = &field.path else {
-                    return Vec::new();
+                    return Rc::from(Vec::new());
                 };
-                graph
+                let row: Vec<ValueEntry> = graph
                     .objects_for_subject_predicate(subject, path.as_ref())
                     .filter_map(|term| match (&field.kind, term) {
                         (
@@ -80,17 +98,21 @@ impl FormValues {
                             TermRef::NamedNode(_) | TermRef::BlankNode(_),
                         ) => {
                             let nested_subject = term_ref_to_subject(term)?;
-                            Some(ValueEntry::Nested(FormValues::read_from_instance(
-                                schema,
-                                graph,
-                                nested_subject,
-                            )))
+                            Some(ValueEntry::Nested {
+                                subject: Some(subject_ref_to_owned(nested_subject)),
+                                values: Rc::new(FormValues::read_from_instance(
+                                    schema,
+                                    graph,
+                                    nested_subject,
+                                )),
+                            })
                         }
                         (_, TermRef::Literal(l)) => Some(ValueEntry::Literal(l.into_owned())),
                         (_, TermRef::NamedNode(n)) => Some(ValueEntry::Node(n.into_owned())),
                         _ => None,
                     })
-                    .collect()
+                    .collect();
+                Rc::from(row)
             })
             .collect();
         FormValues { entries }
@@ -99,21 +121,23 @@ impl FormValues {
     pub fn get(&self, field_index: usize) -> &[ValueEntry] {
         self.entries
             .get(field_index)
-            .map(Vec::as_slice)
+            .map(|rc| rc.as_ref())
             .unwrap_or(&[])
     }
 
     pub fn set(&mut self, field_index: usize, values: Vec<ValueEntry>) {
         if field_index >= self.entries.len() {
-            self.entries.resize(field_index + 1, Vec::new());
+            self.entries.resize(field_index + 1, Rc::from(Vec::new()));
         }
-        self.entries[field_index] = values;
+        self.entries[field_index] = Rc::from(values);
     }
 
     /// Serialises `subject`'s fields (and, recursively, every `Nested`
-    /// value's own subject — freshly minted blank nodes, one per nested
-    /// entry) as Turtle. `prefixes` are cosmetic only; the triples are the
-    /// same either way.
+    /// value's own subject) as Turtle. `prefixes` are cosmetic only; the
+    /// triples are the same either way. Also asserts `rdf:type` for
+    /// `subject` when `schema.target_class` names one — a `sh:targetClass`
+    /// form, or a value nested under a `sh:class` constraint, is not a
+    /// valid instance of that class without it.
     pub fn to_turtle(
         &self,
         schema: &FormSchema,
@@ -127,6 +151,10 @@ impl FormValues {
                 .expect("caller-supplied prefix IRI must be valid");
         }
         let mut writer = serializer.for_writer(Vec::new());
+        if let Some(class) = &schema.target_class {
+            let _ =
+                writer.serialize_triple(TripleRef::new(subject, oxrdf::vocab::rdf::TYPE, class));
+        }
         self.write_triples(schema, subject, &mut writer);
         String::from_utf8(
             writer
@@ -144,25 +172,63 @@ impl FormValues {
     ) {
         for (field, entries) in schema.fields.iter().zip(&self.entries) {
             let Some(path) = &field.path else { continue };
-            for entry in entries {
+            for entry in entries.iter() {
                 match entry {
+                    // An empty lexical form / empty IRI is what an untouched
+                    // required-but-not-yet-typed-into control looks like
+                    // (see `default_entry`'s Text/Iri blanks) — writing it
+                    // out would assert `ex:name ""` or `ex:home <>`, an
+                    // ill-formed-in-spirit triple that makes "required"
+                    // meaningless. Skipped, not written.
+                    ValueEntry::Literal(lit) if lit.value().is_empty() => {}
+                    ValueEntry::Node(node) if node.as_str().is_empty() => {}
                     ValueEntry::Literal(lit) => {
                         let _ = writer.serialize_triple(TripleRef::new(subject, path, lit));
                     }
                     ValueEntry::Node(node) => {
-                        let _ = writer.serialize_triple(TripleRef::new(subject, path, node));
+                        // An IRI the user typed may not be well-formed —
+                        // `controls.rs`'s Iri control accepts free text as
+                        // they type, on purpose, so a half-typed value
+                        // doesn't fight the user mid-keystroke. Validated
+                        // here, at the one point that matters: what
+                        // actually gets written. An invalid one is skipped
+                        // rather than written as unparseable Turtle.
+                        if NamedNode::new(node.as_str()).is_ok() {
+                            let _ = writer.serialize_triple(TripleRef::new(subject, path, node));
+                        }
                     }
-                    ValueEntry::Nested(nested_values) => {
+                    ValueEntry::Nested {
+                        subject: nested_subject,
+                        values: nested_values,
+                    } => {
                         let FieldKind::Nested {
                             schema: nested_schema,
                         } = &field.kind
                         else {
                             continue;
                         };
-                        let nested_subject = NamedOrBlankNode::BlankNode(BlankNode::default());
-                        let _ =
-                            writer.serialize_triple(TripleRef::new(subject, path, &nested_subject));
-                        nested_values.write_triples(nested_schema, &nested_subject, writer);
+                        // Reuse the subject this value was read from when
+                        // there is one, rather than always minting a fresh
+                        // blank node — the difference between re-saving
+                        // `ex:bob` as `ex:bob` and silently replacing every
+                        // reference to `ex:bob` with a copy of it.
+                        let owned_subject;
+                        let subject_ref = match nested_subject {
+                            Some(s) => s,
+                            None => {
+                                owned_subject = NamedOrBlankNode::BlankNode(BlankNode::default());
+                                &owned_subject
+                            }
+                        };
+                        let _ = writer.serialize_triple(TripleRef::new(subject, path, subject_ref));
+                        if let Some(class) = &nested_schema.target_class {
+                            let _ = writer.serialize_triple(TripleRef::new(
+                                subject_ref,
+                                oxrdf::vocab::rdf::TYPE,
+                                class,
+                            ));
+                        }
+                        nested_values.write_triples(nested_schema, subject_ref, writer);
                     }
                 }
             }
@@ -174,11 +240,25 @@ impl FormValues {
 /// asked for) into the [`ValueEntry`] serialisation should hold, giving it
 /// the field's `original_datatype` when one was stated so a round trip does
 /// not silently widen e.g. `xsd:nonNegativeInteger` to plain `xsd:integer`.
+///
+/// `DateTime` gets one normalisation: an HTML `datetime-local` control's own
+/// value omits seconds when the user hasn't touched them (`"2024-05-01T10:30"`),
+/// which is not a legal `xsd:dateTime` lexical form (seconds are mandatory).
+/// Padded to `:00` here rather than left for a caller to remember, since
+/// every caller goes through this function.
 pub fn literal_entry(field: &Field, lexical: &str) -> ValueEntry {
     let datatype = field
         .original_datatype
         .clone()
         .unwrap_or_else(|| canonical_datatype(&field.kind));
+    let lexical = if matches!(field.kind, FieldKind::DateTime)
+        && lexical.len() == 16
+        && lexical.as_bytes().get(10) == Some(&b'T')
+    {
+        format!("{lexical}:00")
+    } else {
+        lexical.to_string()
+    };
     ValueEntry::Literal(Literal::new_typed_literal(lexical, datatype))
 }
 
@@ -189,12 +269,18 @@ pub fn literal_entry(field: &Field, lexical: &str) -> ValueEntry {
 /// drift apart.
 pub fn default_entry(field: &Field) -> ValueEntry {
     match &field.kind {
-        FieldKind::Nested { schema } => ValueEntry::Nested(FormValues::new_for(schema)),
+        FieldKind::Nested { schema } => ValueEntry::Nested {
+            subject: None,
+            values: Rc::new(FormValues::new_for(schema)),
+        },
         FieldKind::Select { options } => options
             .first()
             .map(|o| option_to_entry(&o.value))
             .unwrap_or_else(|| literal_entry(field, "")),
         FieldKind::Iri => ValueEntry::Node(NamedNode::new_unchecked("")),
+        // "" is not a legal xsd:boolean lexical form; a genuinely blank
+        // boolean is a checkbox that starts unchecked, i.e. false.
+        FieldKind::Boolean => literal_entry(field, "false"),
         _ => literal_entry(field, ""),
     }
 }
@@ -236,5 +322,12 @@ fn term_ref_to_subject(term: TermRef<'_>) -> Option<SubjectRef<'_>> {
         TermRef::NamedNode(n) => Some(SubjectRef::NamedNode(n)),
         TermRef::BlankNode(b) => Some(SubjectRef::BlankNode(b)),
         _ => None,
+    }
+}
+
+fn subject_ref_to_owned(subject: SubjectRef<'_>) -> NamedOrBlankNode {
+    match subject {
+        SubjectRef::NamedNode(n) => NamedOrBlankNode::NamedNode(n.into_owned()),
+        SubjectRef::BlankNode(b) => NamedOrBlankNode::BlankNode(b.into_owned()),
     }
 }
