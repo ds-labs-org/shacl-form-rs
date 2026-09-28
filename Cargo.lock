@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "demo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "shacl-form-core",
  "shacl-form-yew",
@@ -863,7 +863,7 @@ dependencies = [
 
 [[package]]
 name = "shacl-form-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom",
  "oxrdf",
@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "shacl-form-yew"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "getrandom",
  "gloo-timers",
