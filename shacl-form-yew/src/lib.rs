@@ -4,9 +4,11 @@
 //! only renders [`shacl_form_core::FormSchema`] and turns DOM events back
 //! into [`shacl_form_core::ValueEntry`] values.
 mod controls;
+pub mod overrides;
 pub mod paths;
 mod render;
 
+use overrides::FieldOverrides;
 use paths::{FormAction, FormState, Loc};
 use shacl_form_core::oxrdf::{BlankNode, NamedNode, NamedOrBlankNode};
 use shacl_form_core::{
@@ -40,6 +42,12 @@ pub struct ShaclFormProps {
     pub instance_subject_iri: Option<AttrValue>,
     #[prop_or_default]
     pub new_subject_iri: Option<AttrValue>,
+    /// Replaces specific fields' rendered controls with a host-supplied
+    /// Yew component — see `overrides`'s own doc comment. `None` (the
+    /// default) renders every field with this crate's own built-in
+    /// controls, exactly as before this existed.
+    #[prop_or_default]
+    pub field_overrides: Option<Rc<FieldOverrides>>,
     /// Called with the produced Turtle when the form is submitted. This
     /// component never sends it anywhere itself — see the workspace
     /// README's scope note on why persistence is a host concern.
@@ -124,6 +132,10 @@ pub fn shacl_form(props: &ShaclFormProps) -> Html {
         values: FormValues::default(),
     });
     let subject = use_state(|| None::<NamedOrBlankNode>);
+    // Declared unconditionally, alongside every other hook, even though
+    // it's only ever read/set from the `Ok(_)` arm below — Yew requires
+    // every hook call at the function's top level, never inside a branch.
+    let errors = use_state(Vec::<String>::new);
     {
         let state = state.clone();
         let parsed = parsed.clone();
@@ -157,19 +169,42 @@ pub fn shacl_form(props: &ShaclFormProps) -> Html {
                 let state = state.clone();
                 let subject = subject.clone();
                 let cb = props.onsubmit.clone();
+                let overrides = props.field_overrides.clone();
+                let errors = errors.clone();
                 Callback::from(move |e: SubmitEvent| {
                     e.prevent_default();
                     let Some(subject) = subject.as_ref() else {
                         return;
                     };
+                    // Native HTML5 constraint validation already covers
+                    // every built-in control (the browser refuses to fire
+                    // `submit` at all otherwise); this only ever needs to
+                    // check fields a host has overridden with its own
+                    // control, which the browser has no attribute-based
+                    // way to validate — see `overrides::validate_overridden`.
+                    let found = overrides
+                        .as_ref()
+                        .map(|o| overrides::validate_overridden(&state.schema, &state.values, o))
+                        .unwrap_or_default();
+                    if !found.is_empty() {
+                        errors.set(found);
+                        return;
+                    }
+                    errors.set(Vec::new());
                     let turtle = state.values.to_turtle(&state.schema, subject, &[]);
                     cb.emit(AttrValue::from(turtle));
                 })
             };
             let root_loc = Loc::root;
+            let overrides = props.field_overrides.clone();
             html! {
                 <form class="shacl-form" onsubmit={onsubmit}>
-                    { render::render_fields(&state.schema, &state.values, &root_loc, dispatch) }
+                    { render::render_fields(&state.schema, &state.values, &root_loc, dispatch, overrides.as_deref()) }
+                    { if errors.is_empty() { html!{} } else { html! {
+                        <ul class="shacl-form-error">
+                            { for errors.iter().map(|e| html!{ <li>{ e }</li> }) }
+                        </ul>
+                    } } }
                     <button type="submit">{ "Submit" }</button>
                 </form>
             }

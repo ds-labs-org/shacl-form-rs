@@ -17,6 +17,13 @@ readme = "../README.md"
 oxrdf = "0.2"
 oxttl = "0.1"
 thiserror = "2"
+# check_constraints's own sh:pattern evaluation (validate.rs) -- SHACL's
+# unanchored substring match needs no anchoring trick here, unlike
+# controls.rs's HTML-attribute-facing combined_pattern, so the plain
+# linear-time `regex` engine (no backtracking, no lookaround -- which
+# XPath/SHACL pattern syntax doesn't have either) is the right fit, and
+# compiles to wasm32 with no OS dependency.
+regex = "1"
 
 # getrandom's default backend has no wasm32-unknown-unknown support at all (it
 # needs an OS RNG syscall that target doesn't have); the "js" feature switches

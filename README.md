@@ -92,6 +92,58 @@ whole tree for a host that just wants one list to show a reader (and does so
 in time proportional to the tree's *distinct* schemas, not to how many
 `Nested` fields happen to point at a shared one — see its own doc comment).
 
+## Custom field controls
+
+`ShaclFormProps::field_overrides` replaces specific fields' rendered
+controls with a host-supplied Yew component — a date-picker, an
+autocomplete widget, whatever a plain `<input>` can't do — with its own
+CSS and its own extra validation, without forking `render_control` or this
+crate at all.
+
+```rust
+use shacl_form_yew::overrides::{FieldOverride, FieldOverrides, FieldSelector};
+use shacl_form_core::oxrdf::NamedNode;
+use shacl_form_core::ValueEntry;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+let mut overrides: FieldOverrides = HashMap::new();
+overrides.insert(
+    // Selected by sh:path (an exact field) or sh:datatype (every field of
+    // that type) -- Path wins when both could match the same field.
+    FieldSelector::Path(NamedNode::new("http://example.org/email").unwrap()),
+    FieldOverride {
+        render: Rc::new(|_field, current, onchange| {
+            // Build whatever Html you want here -- your own component,
+            // your own classes, your own CSS. `onchange` feeds a new
+            // ValueEntry back into the form exactly like a built-in
+            // control's own onchange does.
+            html! { <MyEmailInput value={..} onchange={onchange} /> }
+        }),
+        // Runs IN ADDITION to this field's own sh:pattern/length/bounds
+        // (shacl_form_core::check_constraints), not instead of them.
+        validate: Some(Rc::new(|entry| {
+            /* your own extra check */ Ok(())
+        })),
+    },
+);
+// ... pass `Some(Rc::new(overrides))` as ShaclFormProps::field_overrides
+```
+
+What stays built-in around the override: the field's label,
+required-marker, description, `unsupported` note, and (for a repeatable
+field) its add/remove controls — only what `render_control` would have
+returned for that one field is replaced.
+
+Native HTML5 constraint validation only ever applies to a real
+`<input>`/`<select>` this crate itself rendered, so it can't see a
+host-supplied control at all. Submitting the form therefore runs
+`check_constraints` (and any `validate` an override supplies) against
+every *overridden* field's current value first; a failure blocks
+submission and lists the reasons (`.shacl-form-error`) instead of calling
+`onsubmit`. Built-in fields are unaffected either way — still pure native
+HTML5 validation, exactly as before this existed.
+
 ## Known limitations
 
 - `sh:or`/`sh:xone` render only their first branch.

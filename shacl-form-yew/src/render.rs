@@ -5,6 +5,7 @@
 //! `FormSchema`/`FormValues` at all) — the actual edit happens once, in
 //! `FormState::reduce` (`crate::paths`), not once per callback capture.
 use crate::controls::render_control;
+use crate::overrides::{self, FieldOverrides};
 use crate::paths::{FormAction, Loc};
 use shacl_form_core::{Field, FieldKind, FormSchema, FormValues, ValueEntry};
 use yew::prelude::*;
@@ -14,11 +15,12 @@ pub fn render_fields(
     values: &FormValues,
     make_loc: &dyn Fn(usize) -> Loc,
     dispatch: Callback<FormAction>,
+    overrides: Option<&FieldOverrides>,
 ) -> Html {
     html! {
         <>
         { for schema.fields.iter().enumerate().map(|(idx, field)|
-            render_one_field(values, idx, field, make_loc, dispatch.clone())
+            render_one_field(values, idx, field, make_loc, dispatch.clone(), overrides)
         ) }
         </>
     }
@@ -30,6 +32,7 @@ fn render_one_field(
     field: &Field,
     make_loc: &dyn Fn(usize) -> Loc,
     dispatch: Callback<FormAction>,
+    overrides: Option<&FieldOverrides>,
 ) -> Html {
     let loc = make_loc(idx);
     let entries = values.get(idx);
@@ -41,7 +44,17 @@ fn render_one_field(
     let rows: Vec<Html> = entries
         .iter()
         .enumerate()
-        .map(|(rep, entry)| render_one_entry(field, rep, entry, &loc, dispatch.clone(), can_remove))
+        .map(|(rep, entry)| {
+            render_one_entry(
+                field,
+                rep,
+                entry,
+                &loc,
+                dispatch.clone(),
+                can_remove,
+                overrides,
+            )
+        })
         .collect();
 
     let add_button = can_add.then(|| {
@@ -71,6 +84,7 @@ fn render_one_entry(
     loc: &Loc,
     dispatch: Callback<FormAction>,
     can_remove: bool,
+    overrides: Option<&FieldOverrides>,
 ) -> Html {
     let remove_button = can_remove.then(|| {
         let loc = loc.clone();
@@ -98,7 +112,7 @@ fn render_one_entry(
             let make_child_loc = move |inner_idx: usize| child_loc.child(rep, inner_idx);
             html! {
                 <fieldset class="shacl-form-nested" key={rep}>
-                    { render_fields(nested_schema, nested_values, &make_child_loc, dispatch.clone()) }
+                    { render_fields(nested_schema, nested_values, &make_child_loc, dispatch.clone(), overrides) }
                     { remove_button }
                 </fieldset>
             }
@@ -120,9 +134,17 @@ fn render_one_entry(
                     repetition: rep,
                 })
             });
+            // A host-supplied override takes over just the control itself
+            // (this crate still rendered the label/description/required-
+            // marker above, and still renders the remove button below) —
+            // see `overrides`'s own doc comment for why.
+            let control = match overrides.and_then(|o| overrides::lookup(o, field)) {
+                Some(over) => (over.render)(field, Some(entry), onchange),
+                None => render_control(field, Some(entry), onchange, on_clear),
+            };
             html! {
                 <span class="shacl-form-entry" key={rep}>
-                    { render_control(field, Some(entry), onchange, on_clear) }
+                    { control }
                     { remove_button }
                 </span>
             }

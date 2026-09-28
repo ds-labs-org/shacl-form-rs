@@ -6,8 +6,12 @@
 //! serialised Turtle) end to end, not just that each piece compiles.
 #![cfg(target_arch = "wasm32")]
 
+use shacl_form_core::ValueEntry;
+use shacl_form_core::oxrdf::{Literal, NamedNode as CoreNamedNode};
+use shacl_form_yew::overrides::{FieldOverride, FieldOverrides, FieldSelector};
 use shacl_form_yew::{ShaclForm, ShaclFormProps, Target};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
@@ -52,6 +56,7 @@ async fn typing_a_name_and_submitting_emits_it_as_turtle() {
         instance_ttl: None,
         instance_subject_iri: Some(AttrValue::from("http://example.org/alice")),
         new_subject_iri: None,
+        field_overrides: None,
         onsubmit,
     };
 
@@ -95,6 +100,135 @@ async fn typing_a_name_and_submitting_emits_it_as_turtle() {
     document().body().unwrap().remove_child(&container).unwrap();
 }
 
+const OVERRIDE_SHAPES: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <http://example.org/> .
+ex:S a sh:NodeShape ;
+  sh:property [ sh:path ex:email ; sh:name "Email" ; sh:datatype xsd:string ; sh:minCount 1 ] .
+"#;
+
+/// End-to-end proof of the `field_overrides` feature: a host-supplied
+/// component replaces the built-in control for `ex:email`, and its own
+/// validator (on top of `check_constraints`) blocks submission for a value
+/// that doesn't look like an email address — something native HTML5
+/// constraint validation has no way to do here, since the override's
+/// control isn't a real `<input type=email>` the browser itself validates.
+#[wasm_bindgen_test]
+async fn a_field_override_replaces_the_control_and_its_validator_blocks_submission() {
+    let container: Element = document().create_element("div").unwrap();
+    document().body().unwrap().append_child(&container).unwrap();
+
+    let received: Rc<RefCell<Option<AttrValue>>> = Rc::new(RefCell::new(None));
+    let onsubmit = {
+        let received = received.clone();
+        Callback::from(move |turtle: AttrValue| *received.borrow_mut() = Some(turtle))
+    };
+
+    let mut overrides: FieldOverrides = HashMap::new();
+    overrides.insert(
+        FieldSelector::Path(CoreNamedNode::new("http://example.org/email").unwrap()),
+        FieldOverride {
+            render: Rc::new(|_field, current, onchange| {
+                let value = match current {
+                    Some(ValueEntry::Literal(l)) => l.value().to_string(),
+                    _ => String::new(),
+                };
+                let oninput = onchange.reform(|e: InputEvent| {
+                    let value = e
+                        .target_dyn_into::<HtmlInputElement>()
+                        .map(|el| el.value())
+                        .unwrap_or_default();
+                    ValueEntry::Literal(Literal::new_simple_literal(value))
+                });
+                html! { <input type="text" class="custom-email" value={value} oninput={oninput} /> }
+            }),
+            validate: Some(Rc::new(|entry| {
+                let ValueEntry::Literal(l) = entry else {
+                    return Ok(());
+                };
+                if l.value().contains('@') {
+                    Ok(())
+                } else {
+                    Err("must contain @".to_string())
+                }
+            })),
+        },
+    );
+
+    let props = ShaclFormProps {
+        shapes_ttl: AttrValue::from(OVERRIDE_SHAPES),
+        target: Target::ShapeIri(AttrValue::from("http://example.org/S")),
+        instance_ttl: None,
+        instance_subject_iri: Some(AttrValue::from("http://example.org/x")),
+        new_subject_iri: None,
+        field_overrides: Some(Rc::new(overrides)),
+        onsubmit,
+    };
+    let _handle =
+        yew::Renderer::<ShaclForm>::with_root_and_props(container.clone(), props).render();
+    settle().await;
+    settle().await;
+
+    // The custom control rendered, not the built-in text input.
+    let input = container
+        .query_selector("input.custom-email")
+        .unwrap()
+        .expect("the override's own control rendered")
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
+
+    let form = container
+        .query_selector("form")
+        .unwrap()
+        .expect("the form rendered")
+        .dyn_into::<web_sys::HtmlFormElement>()
+        .unwrap();
+
+    // An invalid value: the override's own validator must block submission.
+    input.set_value("not-an-email");
+    input
+        .dispatch_event(&web_sys::Event::new("input").unwrap())
+        .unwrap();
+    settle().await;
+    form.request_submit().unwrap();
+    settle().await;
+    settle().await;
+
+    assert!(
+        received.borrow().is_none(),
+        "onsubmit must not fire while the override's validator rejects the current value"
+    );
+    let error_text = container
+        .query_selector(".shacl-form-error")
+        .unwrap()
+        .expect("a validation error must be shown")
+        .text_content()
+        .unwrap_or_default();
+    assert!(
+        error_text.contains("Email") && error_text.contains('@'),
+        "{error_text}"
+    );
+
+    // A valid value: submission must now succeed.
+    input.set_value("alice@example.org");
+    input
+        .dispatch_event(&web_sys::Event::new("input").unwrap())
+        .unwrap();
+    settle().await;
+    form.request_submit().unwrap();
+    settle().await;
+    settle().await;
+
+    let turtle = received
+        .borrow()
+        .clone()
+        .expect("onsubmit must fire once the override's validator accepts the value");
+    assert!(turtle.contains("alice@example.org"), "{turtle}");
+
+    document().body().unwrap().remove_child(&container).unwrap();
+}
+
 const SELECT_SHAPES: &str = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
 @prefix ex: <http://example.org/> .
@@ -131,6 +265,7 @@ async fn two_sh_in_options_with_the_same_lexical_string_are_told_apart() {
         )),
         instance_subject_iri: Some(AttrValue::from("http://example.org/x")),
         new_subject_iri: None,
+        field_overrides: None,
         onsubmit,
     };
     let _handle =
@@ -218,6 +353,7 @@ async fn two_edits_dispatched_before_any_rerender_both_survive() {
         instance_ttl: None,
         instance_subject_iri: Some(AttrValue::from("http://example.org/x")),
         new_subject_iri: None,
+        field_overrides: None,
         onsubmit,
     };
     let _handle =
