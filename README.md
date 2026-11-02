@@ -83,6 +83,7 @@ see `shacl-form-core/tests/honeycomb.rs`), not just hand-written fixtures.
 | a numeric bound (`sh:minInclusive` and friends) whose literal isn't itself numeric (paired with `xsd:date`/`xsd:dateTime`, say — a legal pairing this crate's `Date`/`DateTime` controls don't apply a bound to yet) | named in `unsupported` as "stated but not a number this crate can compare against", distinctly from a bound that was never stated at all |
 | a `sh:deactivated` node shape's own `sh:node`/`sh:and` ("shape inheritance") references | not expanded — a deactivated shape contributes nothing at all, not just its own direct `sh:property` list |
 | `sh:datatype rdf:langString` | `Text`, recognised (not reported as an unrecognised datatype); editing a value read with a language tag keeps that tag (`literal_entry_with_language`) rather than silently discarding it for a plain typed literal, and a fresh value with no tag to keep serialises as a plain untyped literal rather than the illegal `"…"^^rdf:langString` |
+| a blank-node value on a property this crate cannot nest (`sh:class` with no matching shape, `sh:nodeKind sh:BlankNodeOrIRI`, or a `sh:node`/`sh:class` reference past `MAX_NESTING_DEPTH`) | kept, not dropped: `read_from_instance` stores it with its whole blank-node closure (every triple about it and about each blank node reachable from it, cycles followed once) and `to_turtle` writes it back unchanged, so "open, then save" no longer deletes it. Not editable (no control to edit it in), never part of `FormValues::get`'s rows; counted by `FormValues::preserved`, and the rendered field says how many it holds (`.shacl-form-preserved`) |
 | `Select` (`sh:in`/`sh:hasValue`) matching the *current* value to an option, and turning a picked option back into a value | by the option's own index, not its lexical string — two terms that stringify the same (`"chat"@fr` vs `"chat"@en`, or `1` vs `"1"`) are told apart instead of colliding onto one |
 
 Nothing here is silently approximated: a construct this crate can't
@@ -179,7 +180,7 @@ HTML5 validation, exactly as before this existed.
   `ds-honeycomb-editor-rs` has one) yet.
 - `shacl-form-yew` ships no CSS at all — the host supplies class names
   (`shacl-form-field`, `shacl-form-nested`, `shacl-form-entry`,
-  `shacl-form-error`, `shacl-form-unsupported`, `shacl-form-required`,
+  `shacl-form-error`, `shacl-form-unsupported`, `shacl-form-preserved`, `shacl-form-required`,
   `shacl-form-add`/`shacl-form-remove`) the same way `ds-honeycomb-editor-rs`
   leaves colour and theme to its host.
 - `read_from_instance` shares one `Rc<FormValues>` across every occurrence
@@ -196,11 +197,6 @@ HTML5 validation, exactly as before this existed.
   distinct subject: closing both fully would need the renderer to
   understand "this is the same resource shown twice", which is a bigger,
   separate redesign.
-- A blank-node-valued property this crate cannot nest (`sh:class` with no
-  matching shape, `sh:nodeKind sh:BlankNodeOrIRI`, or a `sh:node`/`sh:class`
-  reference past `MAX_NESTING_DEPTH`) is invisible to `read_from_instance`:
-  the value is neither shown nor kept, so re-saving an otherwise-untouched
-  instance silently drops it rather than round-tripping it unedited.
 - `xsd:dateTimeStamp` (a timezone is mandatory) uses the same
   `datetime-local` control as `xsd:dateTime` (no timezone at all), so an
   edited value is never a legal lexical form for it; reading back an

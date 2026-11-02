@@ -5,7 +5,8 @@
 use crate::model::{Field, FieldKind, FormSchema};
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{
-    BlankNode, Graph, Literal, NamedNode, NamedOrBlankNode, SubjectRef, Term, TermRef, TripleRef,
+    BlankNode, BlankNodeRef, Graph, Literal, NamedNode, NamedOrBlankNode, SubjectRef, Term,
+    TermRef, Triple, TripleRef,
 };
 use oxttl::TurtleSerializer;
 use std::collections::{HashMap, HashSet};
@@ -41,9 +42,33 @@ pub enum ValueEntry {
 /// row, at every level, is a pointer bump, not a copy of its contents. A
 /// plain `Vec<Vec<ValueEntry>>` would deep-clone the whole tree (all
 /// literals, all nested repetitions, everywhere) on every single keystroke.
+///
+/// Alongside the editable rows, each field can also carry *preserved*
+/// values: blank-node objects `read_from_instance` found on a field it has
+/// no way to nest (a `sh:class` with no matching shape, `sh:nodeKind
+/// sh:BlankNodeOrIRI`, a `sh:node`/`sh:class` reference past the nesting
+/// depth cap). Such a value has no control to show it in, but dropping it
+/// would make "open, then save" silently delete it — and everything only
+/// reachable through it. So each one is kept, together with its full
+/// blank-node closure (every triple about it, and about every blank node
+/// reachable from it), and written back out unchanged by
+/// [`FormValues::to_turtle`]. They are not part of [`FormValues::get`]'s
+/// rows, so an edit, add or remove never touches them; see
+/// [`FormValues::preserved`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FormValues {
     entries: Vec<Rc<[ValueEntry]>>,
+    /// Parallel to `entries`, but usually empty (no field holds an
+    /// un-nestable blank node): a missing index means "nothing preserved".
+    preserved: Vec<Rc<[PreservedNode]>>,
+}
+
+/// One blank-node value carried through a re-save unedited, with every
+/// triple describing it (see [`FormValues`]'s own doc comment).
+#[derive(Debug, Clone, PartialEq)]
+struct PreservedNode {
+    node: BlankNode,
+    description: Rc<[Triple]>,
 }
 
 impl FormValues {
@@ -73,7 +98,10 @@ impl FormValues {
                 Rc::from(entries)
             })
             .collect();
-        FormValues { entries }
+        FormValues {
+            entries,
+            preserved: Vec::new(),
+        }
     }
 
     /// Reads whatever `subject` already asserts for each of `schema`'s
@@ -104,8 +132,20 @@ impl FormValues {
         let mut cache: ReadCache = HashMap::new();
         let mut ancestors: HashSet<String> = HashSet::new();
         ancestors.insert(subject_key(subject));
-        let entries = read_fields(schema, graph, subject, &mut cache, &mut ancestors);
-        FormValues { entries }
+        read_values(schema, graph, subject, &mut cache, &mut ancestors)
+    }
+
+    /// The blank nodes `read_from_instance` found on field `field_index`
+    /// but could not turn into an editable entry — kept, with their whole
+    /// description, and re-emitted by [`FormValues::to_turtle`] unchanged
+    /// (see this type's own doc comment). A host that wants to tell the
+    /// reader "this field also holds N value(s) this form can't edit" can
+    /// count them here; they are never part of [`FormValues::get`].
+    pub fn preserved(&self, field_index: usize) -> impl Iterator<Item = &BlankNode> {
+        self.preserved
+            .get(field_index)
+            .into_iter()
+            .flat_map(|row| row.iter().map(|p| &p.node))
     }
 
     pub fn get(&self, field_index: usize) -> &[ValueEntry] {
@@ -169,8 +209,17 @@ impl FormValues {
         writer: &mut oxttl::turtle::WriterTurtleSerializer<W>,
         tree_path: &str,
     ) {
-        for (field_idx, (field, entries)) in schema.fields.iter().zip(&self.entries).enumerate() {
+        for (field_idx, field) in schema.fields.iter().enumerate() {
             let Some(path) = &field.path else { continue };
+            if let Some(row) = self.preserved.get(field_idx) {
+                for kept in row.iter() {
+                    let _ = writer.serialize_triple(TripleRef::new(subject, path, &kept.node));
+                    for triple in kept.description.iter() {
+                        let _ = writer.serialize_triple(triple);
+                    }
+                }
+            }
+            let entries = self.get(field_idx);
             for (rep, entry) in entries.iter().enumerate() {
                 match entry {
                     // An empty lexical form / empty IRI is what an untouched
@@ -372,7 +421,7 @@ fn term_to_entry(term: &Term) -> Option<ValueEntry> {
     }
 }
 
-/// Every `(nested schema, subject)` pair [`read_fields`] has already fully
+/// Every `(nested schema, subject)` pair [`read_values`] has already fully
 /// expanded into an `Rc<FormValues>` — keyed by the schema's own `Rc`
 /// pointer (each nesting *depth* gets its own distinct cached
 /// `Rc<FormSchema>` in `schema.rs`'s `ShapeCache`, so this key, like that
@@ -392,41 +441,77 @@ fn subject_key(subject: SubjectRef<'_>) -> String {
 /// `read_nested` both need, extracted so the entry point doesn't require an
 /// `Rc<FormSchema>` it may not have (a caller's *root* schema is often a
 /// plain `&FormSchema`; only a `Nested` field's own schema is ever `Rc`'d).
-fn read_fields(
+///
+/// A blank-node object on a field that is *not* `Nested` has no entry it
+/// could become; it is kept as a [`PreservedNode`] instead of dropped (see
+/// [`FormValues`]'s own doc comment).
+fn read_values(
     schema: &FormSchema,
     graph: &Graph,
     subject: SubjectRef<'_>,
     cache: &mut ReadCache,
     ancestors: &mut HashSet<String>,
-) -> Vec<Rc<[ValueEntry]>> {
-    schema
-        .fields
-        .iter()
-        .map(|field| {
-            let Some(path) = &field.path else {
-                return Rc::from(Vec::new());
-            };
-            let row: Vec<ValueEntry> = graph
-                .objects_for_subject_predicate(subject, path.as_ref())
-                .filter_map(|term| match (&field.kind, term) {
-                    (
-                        FieldKind::Nested { schema: nested },
-                        TermRef::NamedNode(_) | TermRef::BlankNode(_),
-                    ) => {
-                        let nested_subject = term_ref_to_subject(term)?;
-                        Some(ValueEntry::Nested {
+) -> FormValues {
+    let mut entries = Vec::with_capacity(schema.fields.len());
+    let mut preserved: Vec<Rc<[PreservedNode]>> = Vec::new();
+    for (field_idx, field) in schema.fields.iter().enumerate() {
+        let Some(path) = &field.path else {
+            entries.push(Rc::from(Vec::new()));
+            continue;
+        };
+        let mut row = Vec::new();
+        let mut kept = Vec::new();
+        for term in graph.objects_for_subject_predicate(subject, path.as_ref()) {
+            match (&field.kind, term) {
+                (
+                    FieldKind::Nested { schema: nested },
+                    TermRef::NamedNode(_) | TermRef::BlankNode(_),
+                ) => {
+                    if let Some(nested_subject) = term_ref_to_subject(term) {
+                        row.push(ValueEntry::Nested {
                             subject: Some(subject_ref_to_owned(nested_subject)),
                             values: read_nested(nested, graph, nested_subject, cache, ancestors),
-                        })
+                        });
                     }
-                    (_, TermRef::Literal(l)) => Some(ValueEntry::Literal(l.into_owned())),
-                    (_, TermRef::NamedNode(n)) => Some(ValueEntry::Node(n.into_owned())),
-                    _ => None,
-                })
-                .collect();
-            Rc::from(row)
-        })
-        .collect()
+                }
+                (_, TermRef::Literal(l)) => row.push(ValueEntry::Literal(l.into_owned())),
+                (_, TermRef::NamedNode(n)) => row.push(ValueEntry::Node(n.into_owned())),
+                (_, TermRef::BlankNode(b)) => kept.push(PreservedNode {
+                    node: b.into_owned(),
+                    description: blank_node_closure(graph, b),
+                }),
+            }
+        }
+        entries.push(Rc::from(row));
+        if !kept.is_empty() {
+            preserved.resize(field_idx + 1, Rc::from(Vec::new()));
+            preserved[field_idx] = Rc::from(kept);
+        }
+    }
+    FormValues { entries, preserved }
+}
+
+/// Every triple whose subject is `root` or any blank node reachable from
+/// it through blank-node objects — the part of the graph that exists only
+/// because `root` does, and so would vanish with it. Named nodes are
+/// stopping points (they have their own identity and their own triples
+/// elsewhere); a blank-node cycle is followed once, not forever.
+fn blank_node_closure(graph: &Graph, root: BlankNodeRef<'_>) -> Rc<[Triple]> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<BlankNodeRef<'_>> = HashSet::new();
+    let mut stack = vec![root];
+    seen.insert(root);
+    while let Some(node) = stack.pop() {
+        for triple in graph.triples_for_subject(node) {
+            if let TermRef::BlankNode(b) = triple.object
+                && seen.insert(b)
+            {
+                stack.push(b);
+            }
+            out.push(triple.into_owned());
+        }
+    }
+    Rc::from(out)
 }
 
 /// Reads (or reuses the cached read of) one `Nested` field's value.
@@ -459,9 +544,9 @@ fn read_nested(
         return cached.clone();
     }
     ancestors.insert(subject_key.clone());
-    let entries = read_fields(schema, graph, subject, cache, ancestors);
+    let values = read_values(schema, graph, subject, cache, ancestors);
     ancestors.remove(&subject_key);
-    let rc = Rc::new(FormValues { entries });
+    let rc = Rc::new(values);
     cache.insert(cache_key, rc.clone());
     rc
 }

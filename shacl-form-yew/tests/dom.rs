@@ -412,3 +412,91 @@ async fn two_edits_dispatched_before_any_rerender_both_survive() {
 
     document().body().unwrap().remove_child(&container).unwrap();
 }
+
+const PRESERVED_SHAPES: &str = r#"
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <http://example.org/> .
+ex:S a sh:NodeShape ;
+  sh:property [ sh:path ex:name ; sh:name "Name" ; sh:datatype xsd:string ; sh:order 0 ] ;
+  sh:property [ sh:path ex:address ; sh:name "Address" ; sh:class ex:Address ; sh:order 1 ] .
+"#;
+
+/// An edit form over an instance whose `ex:address` is a blank node with
+/// no matching shape: the field says it holds a value it can't edit, and
+/// submitting after editing a *different* field still emits that address
+/// and its description, instead of silently deleting it.
+#[wasm_bindgen_test]
+async fn an_uneditable_blank_node_value_is_shown_as_kept_and_survives_submit() {
+    let container: Element = document().create_element("div").unwrap();
+    document().body().unwrap().append_child(&container).unwrap();
+
+    let received: Rc<RefCell<Option<AttrValue>>> = Rc::new(RefCell::new(None));
+    let onsubmit = {
+        let received = received.clone();
+        Callback::from(move |turtle: AttrValue| *received.borrow_mut() = Some(turtle))
+    };
+
+    let props = ShaclFormProps {
+        shapes_ttl: AttrValue::from(PRESERVED_SHAPES),
+        target: Target::ShapeIri(AttrValue::from("http://example.org/S")),
+        instance_ttl: Some(AttrValue::from(
+            r#"@prefix ex: <http://example.org/> .
+               ex:alice ex:name "Alice" ; ex:address [ ex:street "1 Main St" ] ."#,
+        )),
+        instance_subject_iri: Some(AttrValue::from("http://example.org/alice")),
+        new_subject_iri: None,
+        field_overrides: None,
+        onsubmit,
+    };
+
+    let _handle =
+        yew::Renderer::<ShaclForm>::with_root_and_props(container.clone(), props).render();
+    settle().await;
+    settle().await;
+
+    let note = container
+        .query_selector(".shacl-form-preserved")
+        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "no preserved note; container was:\n{}",
+                container.inner_html()
+            )
+        });
+    assert!(
+        note.text_content().unwrap_or_default().starts_with('1'),
+        "{:?}",
+        note.text_content()
+    );
+
+    let input = container
+        .query_selector("input[type=text]")
+        .unwrap()
+        .expect("the Name field rendered a text input")
+        .dyn_into::<HtmlInputElement>()
+        .unwrap();
+    input.set_value("Alicia");
+    input
+        .dispatch_event(&web_sys::Event::new("input").unwrap())
+        .unwrap();
+    settle().await;
+
+    container
+        .query_selector("form")
+        .unwrap()
+        .expect("the form rendered")
+        .dyn_into::<web_sys::HtmlFormElement>()
+        .unwrap()
+        .request_submit()
+        .unwrap();
+    settle().await;
+    settle().await;
+
+    let turtle = received.borrow().clone().expect("onsubmit must have fired");
+    assert!(turtle.contains("Alicia"), "{turtle}");
+    assert!(turtle.contains("1 Main St"), "{turtle}");
+    assert!(turtle.contains("address"), "{turtle}");
+
+    document().body().unwrap().remove_child(&container).unwrap();
+}

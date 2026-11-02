@@ -40,6 +40,10 @@ fn render_one_field(
         .max_count
         .is_none_or(|max| (entries.len() as u32) < max);
     let can_remove = (entries.len() as u32) > field.min_count;
+    // Blank-node values read from an existing instance that this field has
+    // no control for (see `FormValues::preserved`) — not editable, but not
+    // invisible either: the reader is told they exist and will be kept.
+    let preserved = values.preserved(idx).count();
 
     let rows: Vec<Html> = entries
         .iter()
@@ -73,6 +77,7 @@ fn render_one_field(
             { for rows }
             { for add_button }
             { for field.unsupported.as_ref().map(|u| html!{ <p class="shacl-form-unsupported" title={u.clone()}>{ "⚠ not fully supported by this generated form" }</p> }) }
+            { for (preserved > 0).then(|| html!{ <p class="shacl-form-preserved">{ format!("{preserved} more value(s) this form can't edit — kept unchanged on save") }</p> }) }
         </div>
     }
 }
